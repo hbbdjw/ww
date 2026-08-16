@@ -1,0 +1,150 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.ww</groupId>
+        <artifactId>runtime-parent</artifactId>
+        <version>1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>runtime-server</artifactId>
+    <name>runtime-server</name>
+    <description>运行时节点进程组装层（允许使用 Spring，不受核心模块依赖门禁约束）</description>
+
+    <dependencies>
+        <!-- runtime 核心模块（Spring-free POJO，由本模块构造注入装配） -->
+        <dependency>
+            <groupId>com.ww</groupId>
+            <artifactId>runtime-common</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>com.ww</groupId>
+            <artifactId>runtime-proto</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>com.ww</groupId>
+            <artifactId>runtime-cluster</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>com.ww</groupId>
+            <artifactId>runtime-membership</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>com.ww</groupId>
+            <artifactId>runtime-capability</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>com.ww</groupId>
+            <artifactId>runtime-placement</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>com.ww</groupId>
+            <artifactId>runtime-scheduler</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>com.ww</groupId>
+            <artifactId>runtime-migration</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <!-- 数据面能力实现：CACHE/STORAGE 的 CapabilityModule + PartitionDataAdapter -->
+        <dependency>
+            <groupId>com.ww</groupId>
+            <artifactId>runtime-data</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <!-- 日志采集核心：appender/缓冲/广播总线 -->
+        <dependency>
+            <groupId>com.ww</groupId>
+            <artifactId>runtime-log</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+
+        <!-- 宿主基础设施：REST 管理端点 + HikariCP DataSource -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-jdbc</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- Boot 4 starter-test 不再传递 awaitility，显式引入（版本由 Boot BOM 管理）供轮询断言 -->
+        <dependency>
+            <groupId>org.awaitility</groupId>
+            <artifactId>awaitility</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- Testcontainers PG 冒烟 IT（版本由 Boot BOM 管理；Boot 4.0.x 管理的是 Testcontainers 2.x 坐标，
+             故依赖名与 1.x 的 org.testcontainers:postgresql / junit-jupiter 不同） -->
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers-postgresql</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers-junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!-- 可执行 jar：repackage 后主产物为可执行 fat jar，原始 jar 保留 .original 后缀 -->
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>repackage</goal>
+                        </goals>
+                        <configuration>
+                        <mainClass>com.ww.runtime.server.RuntimeServerApplication</mainClass>
+                    </configuration>
+                </execution>
+            </executions>
+            </plugin>
+            <!-- Failsafe：*IT.java 在 integration-test/verify 阶段执行（单测 surefire 只跑 *Test）；
+                 插件版本由 spring-boot-starter-parent pluginManagement 管理 -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-failsafe-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>integration-test</goal>
+                            <goal>verify</goal>
+                        </goals>
+                        <configuration>
+                            <includes>
+                                <include>**/*IT.java</include>
+                            </includes>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>

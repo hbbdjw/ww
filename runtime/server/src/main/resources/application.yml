@@ -1,0 +1,72 @@
+# runtime-server 节点配置
+# 覆盖优先级：环境变量（Spring relaxed binding，如 RUNTIME_NODE_ID → runtime.node.id）
+#            > 本文件 > RuntimeProperties @DefaultValue 默认值
+spring:
+  application:
+    name: runtime-server
+  # PostgreSQL 连接（HikariCP 由 spring-boot-starter-jdbc 自动装配；仅 runtime.store=jdbc 时使用）
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/ww}
+    username: ${SPRING_DATASOURCE_USERNAME:ww}
+    password: ${SPRING_DATASOURCE_PASSWORD:ww}
+
+server:
+  # REST 管理端点端口（gRPC 端口见 runtime.node.grpc-port）
+  port: ${SERVER_PORT:8080}
+
+runtime:
+  node:
+    # 节点唯一标识（示例：RUNTIME_NODE_ID=node-2 覆盖）
+    id: ${RUNTIME_NODE_ID:node-1}
+    # 对外主机名/IP（示例：RUNTIME_NODE_HOST=10.0.0.2 覆盖）
+    host: ${RUNTIME_NODE_HOST:localhost}
+    # gRPC 监听端口，0 表示随机端口（单测用，示例：RUNTIME_NODE_GRPC_PORT=0）
+    grpc-port: ${RUNTIME_NODE_GRPC_PORT:9100}
+    weight: ${RUNTIME_NODE_WEIGHT:1.0}
+  # 持久化模式：jdbc（PostgreSQL，默认）| memory（进程内，单测/单机演示，不建任何 JDBC 仓库）
+  store: ${RUNTIME_STORE:jdbc}
+
+  heartbeat-interval-ms: ${RUNTIME_HEARTBEAT_INTERVAL_MS:1000}
+  suspect-after-misses: ${RUNTIME_SUSPECT_AFTER_MISSES:3}
+  dead-after-misses: ${RUNTIME_DEAD_AFTER_MISSES:6}
+
+  scheduler:
+    ttl-ms: ${RUNTIME_SCHEDULER_TTL_MS:10000}
+    renew-interval-ms: ${RUNTIME_SCHEDULER_RENEW_INTERVAL_MS:3000}
+    reconcile-interval-ms: ${RUNTIME_SCHEDULER_RECONCILE_INTERVAL_MS:2000}
+
+  partition-count: ${RUNTIME_PARTITION_COUNT:4096}
+  replication-factor: ${RUNTIME_REPLICATION_FACTOR:1}
+  min-move-ratio: ${RUNTIME_MIN_MOVE_RATIO:0.10}
+  rebalance-cooldown-ms: ${RUNTIME_REBALANCE_COOLDOWN_MS:30000}
+
+  migration:
+    max-concurrent: ${RUNTIME_MIGRATION_MAX_CONCURRENT:2}
+    max-bytes-per-second: ${RUNTIME_MIGRATION_MAX_BYTES_PER_SECOND:67108864}
+    chunk-size: ${RUNTIME_MIGRATION_CHUNK_SIZE:4194304}
+    ack-window: ${RUNTIME_MIGRATION_ACK_WINDOW:8}
+
+  capabilities:
+    # 启动时自动把本节点 MOCK 期望态写为 ACTIVE（调度器随即拉起）；单测关闭后手动 PUT desired 验证
+    mock-desired: ${RUNTIME_CAPABILITIES_MOCK_DESIRED:true}
+    # CACHE 能力：启动时自动写期望态 ACTIVE（默认 false，显式开启避免多能力 placement 引导风暴）
+    cache-desired: ${RUNTIME_CAPABILITIES_CACHE_DESIRED:false}
+    # CACHE AOF 持久化开关与目录
+    cache-aof-enabled: ${RUNTIME_CAPABILITIES_CACHE_AOF_ENABLED:false}
+    cache-data-dir: ${RUNTIME_CAPABILITIES_CACHE_DATA_DIR:./data/cache}
+    # STORAGE 能力：启动时自动写期望态 ACTIVE（默认 false）
+    storage-desired: ${RUNTIME_CAPABILITIES_STORAGE_DESIRED:false}
+    # STORAGE 本地 Drive 路径（逗号分隔；为空时退化为 storage-data-dir 单 Drive）
+    storage-drives: ${RUNTIME_CAPABILITIES_STORAGE_DRIVES:}
+    storage-data-dir: ${RUNTIME_CAPABILITIES_STORAGE_DATA_DIR:./data/storage}
+
+  # 日志采集与实时推送（rt_log 落库 + /rt/log/stream SSE + 跨节点 gRPC 聚合）
+  log:
+    # 是否启用日志落库（false 时仅实时广播不落库）
+    enabled: ${RUNTIME_LOG_ENABLED:true}
+    # 每批最多写入条数
+    batch-size: ${RUNTIME_LOG_BATCH_SIZE:200}
+    # 队列为空时阻塞等待毫秒数（超时即刷出当前批）
+    flush-interval-ms: ${RUNTIME_LOG_FLUSH_INTERVAL_MS:1000}
+    # 内存队列容量（满时丢弃新日志并计数，不阻塞业务线程）
+    queue-capacity: ${RUNTIME_LOG_QUEUE_CAPACITY:10000}

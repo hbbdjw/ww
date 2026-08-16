@@ -1,0 +1,154 @@
+# ============================================================
+#  distributed-runtime 4 节点测试集群编排
+#
+#  一键部署：./runtime/deploy-runtime.sh all（编译 jar + 构建镜像 + 启动）
+#
+#  - 镜像由 runtime/Dockerfile 构建（ww-runtime:latest）
+#  - 数据库复用 WSL 宿主机的 PostgreSQL 18（5432/ww），不再新建 PG 容器；
+#    容器内通过 host.docker.internal（host-gateway）访问宿主机。
+#    前置条件：PG 的 listen_addresses 不能仅为 localhost（需 '*' 或含 docker
+#    网桥地址），且 pg_hba.conf 放行 docker 桥接网段（如 172.16.0.0/12）。
+#  - 故障注入友好：restart: "no"，docker kill 后容器保持停止，
+#    直到手动 docker start，便于验证 DEAD 检测 / 租约接管等场景。
+#  - 节点间 gRPC 走 compose 内部 DNS（RUNTIME_NODE_HOST=服务名，端口 9100），
+#    无需发布到宿主机；此处仍发布 9101-9104 供宿主机侧调试。
+# ============================================================
+
+# 4 节点共享的公共环境变量（YAML 锚点）
+x-runtime-common: &runtime-common
+  RUNTIME_STORE: "jdbc"
+  # 复用 admin application.yml 的数据库连接（WSL 宿主机 PostgreSQL 18）
+  SPRING_DATASOURCE_URL: "jdbc:postgresql://host.docker.internal:5432/ww"
+  SPRING_DATASOURCE_USERNAME: "postgres"
+  SPRING_DATASOURCE_PASSWORD: "jw3344..."
+  # 容器时区与宿主机一致（默认 UTC 会导致日志内嵌时间偏差 8 小时）
+  TZ: "Asia/Shanghai"
+  # ---- 时序参数（与 runtime-scenario.ps1 调优值一致，加快故障注入测试收敛）----
+  RUNTIME_HEARTBEAT_INTERVAL_MS: "500"
+  RUNTIME_SUSPECT_AFTER_MISSES: "2"
+  RUNTIME_DEAD_AFTER_MISSES: "4"
+  RUNTIME_SCHEDULER_TTL_MS: "5000"
+  RUNTIME_SCHEDULER_RENEW_INTERVAL_MS: "1000"
+  RUNTIME_SCHEDULER_RECONCILE_INTERVAL_MS: "500"
+  RUNTIME_REBALANCE_COOLDOWN_MS: "3000"
+  RUNTIME_MIGRATION_MAX_CONCURRENT: "8"
+  # ---- 数据面能力：CACHE / STORAGE（启用后调度器自动引导各自 placement 环）----
+  RUNTIME_CAPABILITIES_CACHE_DESIRED: "true"
+  RUNTIME_CAPABILITIES_CACHE_AOF_ENABLED: "true"
+  RUNTIME_CAPABILITIES_CACHE_DATA_DIR: "/app/data/cache"
+  RUNTIME_CAPABILITIES_STORAGE_DESIRED: "true"
+  RUNTIME_CAPABILITIES_STORAGE_DRIVES: "/app/data/storage/d1,/app/data/storage/d2,/app/data/storage/d3,/app/data/storage/d4"
+
+services:
+  # =============================================
+  # runtime 节点1
+  # =============================================
+  rt-node1:
+    image: ww-runtime:latest
+    container_name: ww-rt-node1
+    environment:
+      <<: *runtime-common
+      RUNTIME_NODE_ID: "node-1"
+      # 对外通告地址 = compose 服务名（docker 内部 DNS 可解析）
+      RUNTIME_NODE_HOST: "rt-node1"
+      RUNTIME_NODE_GRPC_PORT: "9100"
+      SERVER_PORT: "8091"
+    ports:
+      - "8091:8091"   # REST 管理端点 /rt/* + 数据面 /cache/* /storage/*
+      - "9101:9100"   # gRPC（宿主机调试用）
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ww-storage-node1:/app/data/storage
+      - ww-cache-node1:/app/data/cache
+    networks:
+      - ww-runtime-net
+    restart: "no"
+
+  # =============================================
+  # runtime 节点2
+  # =============================================
+  rt-node2:
+    image: ww-runtime:latest
+    container_name: ww-rt-node2
+    environment:
+      <<: *runtime-common
+      RUNTIME_NODE_ID: "node-2"
+      RUNTIME_NODE_HOST: "rt-node2"
+      RUNTIME_NODE_GRPC_PORT: "9100"
+      SERVER_PORT: "8092"
+    ports:
+      - "8092:8092"
+      - "9102:9100"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ww-storage-node2:/app/data/storage
+      - ww-cache-node2:/app/data/cache
+    networks:
+      - ww-runtime-net
+    restart: "no"
+
+  # =============================================
+  # runtime 节点3
+  # =============================================
+  rt-node3:
+    image: ww-runtime:latest
+    container_name: ww-rt-node3
+    environment:
+      <<: *runtime-common
+      RUNTIME_NODE_ID: "node-3"
+      RUNTIME_NODE_HOST: "rt-node3"
+      RUNTIME_NODE_GRPC_PORT: "9100"
+      SERVER_PORT: "8093"
+    ports:
+      - "8093:8093"
+      - "9103:9100"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ww-storage-node3:/app/data/storage
+      - ww-cache-node3:/app/data/cache
+    networks:
+      - ww-runtime-net
+    restart: "no"
+
+  # =============================================
+  # runtime 节点4
+  # =============================================
+  rt-node4:
+    image: ww-runtime:latest
+    container_name: ww-rt-node4
+    environment:
+      <<: *runtime-common
+      RUNTIME_NODE_ID: "node-4"
+      RUNTIME_NODE_HOST: "rt-node4"
+      RUNTIME_NODE_GRPC_PORT: "9100"
+      SERVER_PORT: "8094"
+    ports:
+      - "8094:8094"
+      - "9104:9100"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ww-storage-node4:/app/data/storage
+      - ww-cache-node4:/app/data/cache
+    networks:
+      - ww-runtime-net
+    restart: "no"
+
+networks:
+  ww-runtime-net:
+    driver: bridge
+    name: ww-runtime-net
+
+volumes:
+  # 每节点独立的存储/缓存数据卷（对象存储与 AOF 不可跨节点共享）
+  ww-storage-node1:
+  ww-storage-node2:
+  ww-storage-node3:
+  ww-storage-node4:
+  ww-cache-node1:
+  ww-cache-node2:
+  ww-cache-node3:
+  ww-cache-node4:

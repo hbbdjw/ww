@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+package runtime.v1;
+
+option java_package = "com.ww.runtime.proto";
+option java_multiple_files = true;
+
+// 迁移数据分片
+message DataChunkP {
+  int64 task_id = 1;
+  int32 seq = 2;
+  bool fin = 3;
+  bytes data = 4;
+  string checksum = 5;
+  int64 checkpoint_offset = 6;
+}
+
+message ChunkAckP {
+  int64 task_id = 1;
+  int32 ack_seq = 2;
+  bool ok = 3;
+  string message = 4;
+}
+
+message FetchReq {
+  string capability = 1;
+  int32 partition_id = 2;
+  int64 from_checkpoint = 3;
+}
+
+message TaskControlReq {
+  int64 task_id = 1;
+  string action = 2;
+  string payload_json = 3;
+}
+
+// 任务控制应答（自定义，避免对 cluster.proto 的依赖）
+message TaskAck {
+  bool ok = 1;
+  string message = 2;
+}
+
+message ProgressReport {
+  int64 task_id = 1;
+  string state = 2;
+  int64 checkpoint_offset = 3;
+  int64 items_done = 4;
+}
+
+message ProgressSummary {
+  bool ok = 1;
+  string message = 2;
+}
+
+// 分区迁移：双向流传输 / 拉取 / 任务控制 / 进度上报
+service Migration {
+  rpc TransferStream(stream DataChunkP) returns (stream ChunkAckP);
+  rpc FetchPartition(FetchReq) returns (stream DataChunkP);
+  rpc ControlTask(TaskControlReq) returns (TaskAck);
+  rpc ReportProgress(stream ProgressReport) returns (ProgressSummary);
+}

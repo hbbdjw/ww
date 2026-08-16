@@ -1,0 +1,56 @@
+syntax = "proto3";
+
+package runtime.v1;
+
+option java_package = "com.ww.runtime.proto";
+option java_multiple_files = true;
+
+// 节点资源快照
+message ResourceSnapshotP {
+  double cpu_percent = 1;
+  int64 mem_total_bytes = 2;
+  int64 mem_used_bytes = 3;
+  int64 disk_total_bytes = 4;
+  int64 disk_used_bytes = 5;
+  int64 updated_at_millis = 6;
+}
+
+// 节点信息
+message NodeInfoP {
+  string node_id = 1;
+  string host = 2;
+  int32 grpc_port = 3;
+  string state = 4;
+  int64 state_epoch = 5;
+  double weight = 6;
+  ResourceSnapshotP resources = 7;
+}
+
+// 通用应答
+message Ack {
+  bool ok = 1;
+  string message = 2;
+}
+
+message StartCapabilityReq {
+  string node_id = 1;
+  string capability = 2;
+}
+
+message StopCapabilityReq {
+  string node_id = 1;
+  string capability = 2;
+}
+
+message FreezeReq {
+  string node_id = 1;
+  string capability = 2;
+  bool frozen = 3;
+}
+
+// 集群控制面：能力启停与冻结
+service ClusterControl {
+  rpc StartCapability(StartCapabilityReq) returns (Ack);
+  rpc StopCapability(StopCapabilityReq) returns (Ack);
+  rpc Freeze(FreezeReq) returns (Ack);
+}

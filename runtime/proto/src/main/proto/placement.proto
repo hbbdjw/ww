@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package runtime.v1;
+
+option java_package = "com.ww.runtime.proto";
+option java_multiple_files = true;
+
+message PlacementSnapshotReq {
+  string capability = 1;
+}
+
+// 分区放置：role = PRIMARY / REPLICA
+message PlacementP {
+  string capability = 1;
+  int32 partition_id = 2;
+  string node_id = 3;
+  string role = 4;
+  int64 epoch = 5;
+}
+
+// 放置订阅：服务端按变更推送放置快照
+service PlacementWatch {
+  rpc WatchPlacements(PlacementSnapshotReq) returns (stream PlacementP);
+}

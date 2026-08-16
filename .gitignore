@@ -1,0 +1,67 @@
+# ================== Compiled/Build Output ==================
+target/
+build/
+out/
+dist/
+*.class
+.kotlin/
+!**/src/main/**/target/
+!**/src/test/**/target/
+!**/src/main/**/build/
+!**/src/test/**/build/
+
+# Node.js / Frontend
+node_modules/
+ww-ui/dist/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+dist.zip
+
+# ================== Exclude ALL . starting files/dirs, then whitelist needed configs ==================
+.*
+**/.*
+!.gitignore
+!.dockerignore
+!.editorconfig
+!.npmrc
+!.env
+!.env.development
+!.env.production
+!.env.analyze
+!.browserslistrc
+!.node-version
+!.commitlintrc.js
+!.stylelintignore
+
+# ================== IDE files ==================
+*.iws
+*.iml
+*.ipr
+.factorypath
+.springBeans
+.classpath
+.project
+/nbproject/private/
+/nbbuild/
+/nbdist/
+
+# ================== OS generated files ==================
+.DS_Store
+Thumbs.db
+
+# ================== Logs and temp files ==================
+*.log
+logs/
+*.tmp
+*.bak
+*.swp
+*.swo
+*~
+
+# ================== Local environment overrides ==================
+.env.local
+.env.*.local
+docker-compose.override.yml

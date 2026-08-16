@@ -1,0 +1,154 @@
+# runtime-capability 模块
+
+> 包路径：`com.ww.runtime.capability` ｜ 源码：`runtime/capability/src/main/java/com/ww/runtime/capability/`（8 个主类）
+> 定位：**能力生命周期——启停/预热/排水状态机（骨架）**：单节点视角的能力管理。
+
+## 1. 模块职责
+
+- 定义能力模块 SPI（`CapabilityModule`）：一切"可被托管的生命周期单元"（缓存、对象存储、计算引擎…）抽象为统一的状态机驱动对象；
+- 提供单节点能力管理器（`CapabilityManager`）：静态跃迁表驱动 启停/预热/排水/迁移/冻结；
+- 持久化"节点 × 能力"的**期望态（desired，控制面写入）与实际态（actual，状态机产出）**——二者之差即调度器需收敛的偏差；
+- `MockCapability` 参考实现：演示如何用 `PlacementView` 做 fencing 旧写、如何配合迁移引擎完成分区级 KV 迁移。
+
+## 2. Maven 坐标与依赖
+
+- 坐标：`com.ww:runtime-capability:1.0-SNAPSHOT`
+- 依赖：`runtime-common`、slf4j-api；测试 junit/assertj。
+- 构建门禁：enforcer 禁 Spring/JPA/Caffeine。**不依赖 runtime-placement**（通过 `PlacementView` 端口反转）；不绑定 JDBC 驱动（DataSource 由宿主注入）。
+
+## 3. 关键类详解
+
+### 3.1 CapabilityModule（SPI 接口）
+
+| 方法 | 触发时机 | 语义 |
+|---|---|---|
+| `CapabilityType type()` | — | 能力类型（当前仅 MOCK） |
+| `void start()` | DISABLED→STARTING 后 | 打开底层资源/回放日志；异常→FAILED |
+| `void warm()` | STARTING→WARMING 后 | 加载热点数据；异常→FAILED |
+| `void drain()` | ACTIVE→DRAINING 后 | 停新写、等待在途完成；异常→FAILED |
+| `void stop()` | STOPPING 态 | 刷盘并释放资源；异常→FAILED |
+| `void freeze(boolean)` | 独立开关 | 冻结后新写抛 `RuntimeFrameworkException("frozen")`；**不参与状态机跃迁** |
+| `ResourceDeclaration resources()`（default） | — | 资源声明 record `(cpuWeight, memoryBytes, diskBytes)`，调度装箱估算用，默认 empty |
+
+**实现契约**：钩子在 `CapabilityManager` 命令线程同步调用（应快速返回或自行异步化）；任何钩子异常 → markFailed 并包装上抛；FAILED 后可被重新 start（宿主先经 stop 回 DISABLED）。
+
+### 3.2 CapabilityManager（final，单节点能力管理器）
+
+静态跃迁表 `LEGAL_TRANSITIONS`：
+
+```
+DISABLED → {STARTING}
+STARTING → {WARMING, FAILED}
+WARMING  → {ACTIVE, FAILED}
+ACTIVE   → {DRAINING, FAILED}
+DRAINING → {MIGRATING, ACTIVE, STOPPING, FAILED}
+MIGRATING→ {STOPPING, FAILED}
+STOPPING → {DISABLED, FAILED}
+FAILED   → {DISABLED}
+特殊：markFailed 从任何非 DISABLED 态可达 FAILED（FAILED→FAILED 幂等）；DISABLED→FAILED 非法
+```
+
+| 方法 | 跃迁与钩子 |
+|---|---|
+| `register(module)` | 注册模块；仓库无记录时初始化 desired=actual=DISABLED |
+| `state(type)` | 查询实际态；无记录视为 DISABLED |
+| `start(type)` | **同步三链**：DISABLED→STARTING（调 start()）→ WARMING（调 warm()）→ ACTIVE |
+| `drain(type)` | ACTIVE→DRAINING，调 drain() |
+| `beginMigrate(type)` | DRAINING→MIGRATING，**不调钩子**（数据搬迁由 MigrationEngine 驱动） |
+| `endMigrate(type)` | MIGRATING→STOPPING（requireFrom 唯一来源校验） |
+| `stop(type)` | 三路径：STOPPING→DISABLED（调 stop()）/ DRAINING→STOPPING→DISABLED（调 stop()）/ FAILED→DISABLED（**不调** stop()，模块可能已坏） |
+| `cancelDrain(type)` | DRAINING→ACTIVE（requireFrom 唯一来源 DRAINING） |
+| `freeze(type, frozen)` | 仅透传钩子，无跃迁 |
+| `markFailed(type)` | 非 DISABLED→FAILED |
+| `static isLegalTransition(from, to)` | 静态表判断（markFailed 特殊规则不在表内） |
+
+命令级来源校验（`requireFrom`）：静态表允许一条边多个来源，但单个命令只接受其定义的唯一来源（如 `endMigrate` 只接受 MIGRATING），防止借用其他合法边。
+
+### 3.3 MockCapability（fencing 参考实现）
+
+字段：`self`、`view: PlacementView`、`partitioner: ToIntFunction<String>`、`data: ConcurrentHashMap<String,String>`、`totalPuts: AtomicLong`、`volatile boolean frozen`。
+
+**钩子**：start 清空数据复位冻结位；warm no-op；drain → frozen=true；stop → frozen=true + 清空。
+
+**fencing 写入 `put(key, value, expectedEpoch)`**：
+
+```
+1. frozen → RuntimeFrameworkException("frozen")
+2. partitionOf(key)（partitioner 计算，负数抛 IAE）
+3. view.owner(MOCK, partition):
+   ├─ 无属主                       → StaleEpochException(expected, -1)
+   ├─ 属主 ≠ self                  → StaleEpochException
+   └─ 属主 epoch ≠ expectedEpoch   → StaleEpochException   ← fencing 核心
+4. data.put + totalPuts++
+```
+
+便捷重载 `put(key, value)` 自动取 view 中当前属主纪元。`get(key)` 不做 fencing（冻结态仍可读）。
+
+**迁移 API**（配合 MigrationEngine）：
+
+| 方法 | 用途 |
+|---|---|
+| `exportPartition(partition)` | 源端导出该分区全部 KV |
+| `importPartition(partition, entries)` | 目标端导入（校验 key 归属；**不计 totalPuts**；Map 语义天然幂等 upsert） |
+| `clearPartition(partition)` | 源端在目标确认后清理 |
+
+统计：`totalPuts()` / `totalItems()` / `partitionCounts()` / `partitionCount(p)`。
+
+### 3.4 CapabilityStateStore（接口）
+
+| 方法 | 语义 |
+|---|---|
+| `Optional<CapabilityRecord> get(node, type)` | 读单条 |
+| `void setDesired(node, type, desired)` | 控制面写期望态；记录不存在则创建（actual 默认 DISABLED） |
+| `void setActual(node, type, actual)` | 状态机写实际态；记录不存在则创建（desired 默认 DISABLED） |
+| `List<CapabilityRecord> list()` | 全量（集群视图） |
+
+`CapabilityRecord(NodeId node, CapabilityType type, CapabilityState desired, CapabilityState actual, long updatedAtMillis)`。
+
+### 3.5 InMemoryCapabilityStateStore / JdbcCapabilityStateStore
+
+- 内存版：ConcurrentHashMap + ReentrantLock 串行化单条读-改-写；list 按 node/type 排序。
+- JDBC 版：`INSERT ... ON CONFLICT (node_id, capability) DO UPDATE` 幂等 upsert（首插另一侧状态取默认 'DISABLED'）；SQLException 包装为 `RuntimeFrameworkException`；可注入 Clock。
+
+### 3.6 PlacementView（端口，依赖倒置）
+
+```java
+Optional<Owner> owner(CapabilityType cap, PartitionId partition);
+record Owner(NodeId node, long epoch)   // 属主 + 生效纪元（fencing 依据）
+```
+
+能力模块只依赖本接口获取"某能力某分区当前归谁"，不依赖 placement 模块；宿主（server 的 `PlacementViewAdapter`）用 `PlacementStore` 适配。
+
+### 3.7 CapabilitySchema
+
+`bootstrap(DataSource)` 执行 `sql/rt_capability.sql`（幂等），`pg_advisory_lock(4001, 2)` 串行化。
+**历史修复**：`splitStatements` 原先按分号拆分后跳过 `--` 开头片段，而 DDL 首行即注释导致整段被跳过、真实 PG 建不出表（Testcontainers 冒烟暴露）；现改为**先去行注释再拆分**。
+
+## 4. 数据库表（`sql/rt_capability.sql`）
+
+### rt_capability_state
+
+| 列 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| node_id | VARCHAR(64) | NOT NULL, PK(1) | 节点 |
+| capability | VARCHAR(16) | NOT NULL, PK(2) | 能力类型名 |
+| desired | VARCHAR(16) | NOT NULL DEFAULT 'DISABLED' | 期望态（控制面写） |
+| actual | VARCHAR(16) | NOT NULL DEFAULT 'DISABLED' | 实际态（状态机写） |
+| updated_at | BIGINT | NOT NULL | 更新时间戳 |
+
+## 5. 与其他模块的关系
+
+- 依赖 common；**不依赖 placement**（PlacementView 端口反转，由 server 的 `PlacementViewAdapter` 适配）；
+- scheduler 依赖本模块（CapabilityStateStore 读 desired/actual 差异、CapabilityManager 驱动本节点状态机）；
+- migration 的 `MockPartitionAdapter` 委托 `MockCapability`（同进程源/目标直连）；
+- 与 migration 无编译期依赖，靠模块钩子（export/import/clear）约定协作。
+
+## 6. 测试覆盖
+
+| 测试类 | 覆盖点 |
+|---|---|
+| `CapabilityManagerTest` | 跃迁表 8×8 全矩阵 vs 独立硬编码合法边集合；命令 × 状态全矩阵（合法达目标/非法抛异常且状态不变）；start 完整链钩子顺序；drain→migrate→stop 全链；cancelDrain 后可再 drain；markFailed→stop→restart（FAILED→DISABLED 不调 stop 钩子）；各钩子失败均 markFailed；freeze 仅透传；未注册抛 NoSuchElementException |
+| `MockCapabilityTest` | fencing：无属主/属主异节点/纪元不符（旧与超前）均抛 StaleEpochException 且 totalPuts 不增；便捷 put 属主切换后被拒；冻结 put 抛 frozen 而 get 可读；export→import→clear 往返无损且 import 不计 totalPuts；import 拒绝外分区 key；钩子行为（drain 停新写、stop 清空、start 可重入） |
+| `CapabilitySchemaTest` | DDL 资源打包正确性（表/列/默认值/主键存在） |
+| `InMemoryCapabilityStateStoreTest` | 未知记录 empty；首写创建默认另一侧 DISABLED；desired/actual 独立更新；时间戳跟随 TestClock；list 排序 |
+| `JdbcCapabilityStateStoreTest` | FailingDataSource 下全部操作包装为 RuntimeFrameworkException |

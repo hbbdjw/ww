@@ -1,0 +1,18 @@
+# Node1 覆盖项：HTTP 端口、cache TCP 端口
+server:
+  port: 8081
+
+cache:
+  port: 8701
+
+# 对象存储 Drive：容器内挂载 ww 卷到 /app/data/storage，节点1 使用 node1 子目录
+# 与 node2/node3 物理隔离，避免多节点共写同一路径破坏一致性
+storage:
+  drives:
+    - /app/data/storage/node1/d1
+    - /app/data/storage/node1/d2
+  root-dir: /app/data/storage/node1
+
+logging:
+  file:
+    path: logs/node1

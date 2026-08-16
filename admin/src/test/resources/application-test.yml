@@ -1,0 +1,43 @@
+# 测试环境：PostgreSQL + create-drop + show-sql
+spring:
+  # 排除 Shiro 全部自动配置：测试上下文（最小化 JPA+Blaze+DAO）不加载安全层，
+  # 避免 Shiro starter 因找不到 Realm/SecurityManager 抛异常。
+  # 主应用通过 com.ww.admin.security.ShiroConfig 提供 Realm 等 Bean，不受影响。
+  autoconfigure:
+    exclude:
+      - org.apache.shiro.spring.config.web.autoconfigure.ShiroWebAutoConfiguration
+      - org.apache.shiro.spring.config.web.autoconfigure.ShiroWebFilterConfiguration
+      - org.apache.shiro.spring.config.web.autoconfigure.ShiroWebMvcAutoConfiguration
+      - org.apache.shiro.spring.boot.autoconfigure.ShiroBeanAutoConfiguration
+      - org.apache.shiro.spring.boot.autoconfigure.ShiroAutoConfiguration
+      - org.apache.shiro.spring.boot.autoconfigure.ShiroAnnotationProcessorAutoConfiguration
+  datasource:
+    url: jdbc:p6spy:postgresql://127.0.0.1:54321/ww?currentSchema=public&preferQueryMode=simple
+    username: postgres
+    password: Jw3344...
+    driver-class-name: com.p6spy.engine.spy.P6SpyDriver
+    # HikariCP 测试环境：小池量，快速启动与销毁
+    hikari:
+      maximum-pool-size: 5
+      minimum-idle: 2
+      connection-timeout: 10000
+      pool-name: HikariCP-ww-test
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+    show-sql: true
+    open-in-view: false
+    properties:
+      hibernate:
+        format_sql: true
+        jdbc:
+          batch_size: 50
+          batch_versioned_data: true
+        order_inserts: true
+        order_updates: true
+        default_batch_fetch_size: 16
+
+logging:
+  level:
+    org.hibernate.SQL: debug
+    org.hibernate.orm.jdbc.bind: trace

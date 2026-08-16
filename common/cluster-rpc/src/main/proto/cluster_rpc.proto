@@ -1,0 +1,57 @@
+syntax = "proto3";
+
+package com.ww.rpc.proto;
+
+option java_multiple_files = true;
+option java_package = "com.ww.rpc.grpc.proto";
+option java_outer_classname = "ClusterRpcProto";
+
+// 统一集群 RPC 服务：所有节点间通信走同一个 Service，通过 service_name 分发。
+// 设计参考 TiKV/CockroachDB：统一 RPC 通道 + payload 字节数组，
+// 使得框架层无需感知业务细节，新增业务操作无需修改 .proto 文件。
+service UnifiedRpcService {
+    // 一元 RPC：普通请求-响应模式，用于大多数操作
+    rpc UnaryCall(RpcMessage) returns (RpcResponseMessage);
+
+    // 双向流式 RPC：用于数据同步/Redis Stream/大文件传输等场景
+    rpc StreamCall(stream RpcMessage) returns (stream RpcResponseMessage);
+}
+
+// RPC 请求消息
+message RpcMessage {
+    // 请求唯一 ID，用于链路追踪、幂等性和请求-响应匹配
+    string request_id = 1;
+
+    // 服务名，用于分发到对应的 handler，如 "cache.put"、"storage.replicate"、"db.execSql"
+    string service_name = 2;
+
+    // 业务序列化数据（各模块自行序列化，框架只负责传输）
+    bytes payload = 3;
+
+    // 超时时间（毫秒），0 表示使用服务端默认超时
+    int64 timeout_ms = 4;
+
+    // 元数据头：trace_id、source_node_id、auth_token 等
+    map<string, string> headers = 5;
+}
+
+// RPC 响应消息
+message RpcResponseMessage {
+    // 对应请求的 ID
+    string request_id = 1;
+
+    // 状态码：0=OK, 1=NOT_LEADER, 2=NO_LEADER, 3=TIMEOUT, 4=UNAVAILABLE, 5=ERROR
+    int32 status = 2;
+
+    // 业务响应数据
+    bytes payload = 3;
+
+    // 当 status=NOT_LEADER 时，提示客户端重定向到的节点地址（host:port）
+    string leader_hint = 4;
+
+    // 错误信息
+    string error_message = 5;
+
+    // 响应元数据
+    map<string, string> headers = 6;
+}

@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package runtime.v1;
+
+import "cluster.proto";
+
+option java_package = "com.ww.runtime.proto";
+option java_multiple_files = true;
+
+// 成员心跳请求：携带自描述节点信息
+message HeartbeatReq {
+  NodeInfoP self = 1;
+}
+
+// 成员心跳应答：当前全量成员视图
+message HeartbeatAck {
+  repeated NodeInfoP members = 1;
+}
+
+message WatchReq {
+}
+
+// 成员变更事件：type = JOINED / UPDATED / LEFT 等
+message MembershipEvent {
+  string type = 1;
+  NodeInfoP node = 2;
+}
+
+// 成员关系：双向流心跳 + 服务端推送变更
+service Membership {
+  rpc Heartbeat(stream HeartbeatReq) returns (stream HeartbeatAck);
+  rpc Watch(WatchReq) returns (stream MembershipEvent);
+}

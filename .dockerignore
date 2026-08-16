@@ -1,0 +1,9 @@
+# 后端 Docker 构建忽略（构建上下文为项目根目录）
+.git
+.gitignore
+ww-ui/
+*.log
+.idea
+.vscode
+common/*/target
+core/*/target

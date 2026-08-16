@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- runtime-server logback 配置：控制台 + DB 采集 appender。
+     CONSOLE_LOG_PATTERN 来自 Spring Boot defaults.xml，保持 Boot 默认控制台格式。
+     DB appender 仅做轻量转换与入队（业务线程零 IO），批量落库与实时广播由
+     RuntimeLogBatchWriter 后台线程完成；防死循环策略见 DbLogAppender javadoc。 -->
+<configuration>
+    <include resource="org/springframework/boot/logging/logback/defaults.xml"/>
+
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>${CONSOLE_LOG_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <appender name="DB" class="com.ww.runtime.log.DbLogAppender"/>
+
+    <root level="INFO">
+        <appender-ref ref="CONSOLE"/>
+        <appender-ref ref="DB"/>
+    </root>
+</configuration>

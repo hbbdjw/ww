@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+package runtime.v1;
+
+option java_package = "com.ww.runtime.proto";
+option java_multiple_files = true;
+
+// 日志流订阅请求（过滤条件在对端就地生效，减少转发量；空串 = 不过滤）
+message LogStreamReq {
+  string level = 1;
+  string node = 2;
+  string keyword = 3;
+}
+
+// 单条日志事件
+message LogEventP {
+  string level = 1;
+  string logger_name = 2;
+  string thread_name = 3;
+  string message = 4;
+  string stack_trace = 5;
+  string node = 6;
+  int64 timestamp = 7;
+}
+
+// 节点日志流：server-streaming 单向推送（订阅即持续接收，直至客户端取消）。
+// hub 聚合模式下对端节点只推本节点日志、不递归 fan-out，天然无环路。
+service LogStream {
+  rpc Stream(LogStreamReq) returns (stream LogEventP);
+}

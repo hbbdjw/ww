@@ -1,0 +1,162 @@
+# runtime-placement 模块
+
+> 包路径：`com.ww.runtime.placement` ｜ 源码：`runtime/placement/src/main/java/com/ww/runtime/placement/`（11 个主类）
+> 定位：**放置管理——分区放置快照与订阅（骨架）**：加权 HRW 放置决策 + CAS 切主 + 再均衡规划。
+
+## 1. 模块职责
+
+- 基于加权 HRW（Rendezvous Hashing）为每个分区计算 PRIMARY/REPLICA 放置，**跨节点/跨重启可复现**；
+- 提供 key→partition 的静态稳定映射（`Partitioner`）；
+- 放置存储（`PlacementStore`）两类写入语义：全量重算替换（`replaceAll`）与单分区 CAS 切主（`cutover`）；
+- 再均衡规划器（`RebalancePlanner`）：最小差集迁移计划 + 移动比例阈值 + 冷却时间防抖。
+
+## 2. Maven 坐标与依赖
+
+- 坐标：`com.ww:runtime-placement:1.0-SNAPSHOT`
+- 依赖：`runtime-common`、slf4j-api；测试 junit/assertj。
+- 构建门禁：enforcer 禁 Spring/JPA/Caffeine。**不依赖 capability/proto/scheduler**——被 scheduler/migration 消费，被 capability 经端口（PlacementView）间接消费。
+
+## 3. 关键类详解
+
+### 3.1 Partitioner（key → partition 纯函数）
+
+**算法**（与 WeightedRendezvousHash 同族）：
+
+```
+hash     = MD5(key.getBytes(UTF_8)) 前 8 字节按大端构造 64 位 long
+unsigned = hash & 0x7FFFFFFFFFFFFFFFL          （清符号位）
+partition = (int)(unsigned % partitionCount)   ∈ [0, partitionCount)
+```
+
+- `static int partition(String key, int partitionCount)`；count <= 0 抛 IAE。
+- 性质：无状态纯函数，partitionCount 不变则同一 key 恒得同一分区（任意节点/任意时刻/跨重启）。
+- 实现：`ThreadLocal<MessageDigest>` 缓存 MD5。
+- **注意：哈希算法是 MD5 派生（非 xxHash）**；partitionCount 可配置，默认 4096 为设计基准。
+
+### 3.2 WeightedRendezvousHash\<N extends WeightedNode\>（加权 HRW）
+
+`List<N> selectNodes(String input, int count)` —— 按分数降序取前 `min(count, nodes.size())` 个节点。
+
+**加权分数公式**：
+
+```
+hash = MD5(input + ":" + node.nodeKey()) 前 8 字节构造 long（大端）
+h    = (hash & 0x7FFF...) / (double) Long.MAX_VALUE    ∈ (0, 1]
+h <= 0 时置 Double.MIN_VALUE（防 -ln(0) 溢出）
+weight <= 0 时置 1.0
+score = -ln(h) × weight          ← 权重越大分数越高、越易被选中
+```
+
+平分时保留列表序靠前者。
+
+**相对旧 common-cluster `RendezvousHash` 的两处关键修复**（Javadoc 详述）：
+1. **除数修复**：原实现 `(double)(1L << 63)` 是负数（Long.MIN_VALUE），导致 h 为负、被钳为 MIN_VALUE、所有节点同分，HRW 退化为"永远选第一个节点"；正确除数是 `Long.MAX_VALUE`（2^63−1）。
+2. **权重方向修正**：原公式 `-ln(h) / weight` 配"取最大分数"在数学上使权重大的节点分得更少；修正为 `-ln(h) × weight`，使**份额与权重成正比**（权重 1:2 的节点约得 1/3 与 2/3，测试 ±5% 验证）。
+
+### 3.3 WeightedNode（接口）与 PlacementNode（record）
+
+- `WeightedNode`：`String nodeKey()`（hash 输入键）+ `double weight()`（> 0）。
+- `PlacementNode(NodeId id, double weight)`：实现 WeightedNode，`nodeKey()` 返回 `id.value()`；构造校验 id 非空、weight 非 NaN 且 > 0；工厂 `of(id, weight)` / `of(id)`（等权 1.0）。
+
+### 3.4 PlacementEngine（全量放置计算）
+
+| 方法 | 行为 |
+|---|---|
+| `Map<Integer, List<Placement>> compute(capability, nodes, partitionCount, replicationFactor)` | 每分区 `selectNodes("P%06d".formatted(p+1), RF)`；[0]=PRIMARY、其余 REPLICA、epoch=0；返回不可变 map |
+| `Map<Integer, NodeId> computePrimaries(nodes, partitionCount)` | 只算主节点（RF=1 简化版） |
+
+**可复现性关键**：分区输入固定为 `"P000001".."P004096"`（Locale.ROOT 格式化），同节点集+权重下结果恒定 → RebalancePlanner 的"最小移动"成立（新增节点只赢得原本不属于它的分区）。capability 参数仅作集合标识，**不参与 hash**。
+
+### 3.5 Placement（record）
+
+`(int partition, NodeId node, PlacementRole role, long epoch)`；`isPrimary()`。epoch 语义：replaceAll 后为 0；cutover 每成功一次 +1。
+
+### 3.6 PlacementStore（接口）
+
+| 方法 | 语义 |
+|---|---|
+| `replaceAll(capability, placements)` | **原子整体替换**（初始化/重建），epoch 重置 0；重复分区视为非法输入 |
+| `list(capability)` / `get(capability, partition)` | 查询（partition 升序） |
+| `primaries(capability)` | partition → primary 节点映射 |
+| `cutover(capability, partition, newNode, expectedEpoch)` | **单分区 CAS 切主**：仅当 epoch==expected 且 node≠newNode 才 node→newNode、epoch+1；返回是否成功 |
+
+### 3.7 InMemoryPlacementStore
+
+- 每 capability 一个不可变 `Snapshot(placements, byPartition, primaries)`，replaceAll 单次替换引用（原子整体替换）；
+- cutover 在 `ConcurrentHashMap.compute` 原子语义内完成校验+派生新快照。
+
+### 3.8 JdbcPlacementStore
+
+- `replaceAll`：单事务 DELETE+批量 INSERT（手动管理 autoCommit，失败整体回滚）；
+- `cutover`：单条 UPDATE 即 CAS：
+
+```sql
+UPDATE rt_partition_placement
+SET node_id = ?, epoch = epoch + 1, updated_at = ?
+WHERE capability = ? AND partition_id = ? AND epoch = ? AND node_id <> ?
+```
+
+命中 0 行即竞争失败返回 false。
+
+### 3.9 RebalancePlanner
+
+| 方法 | 行为 |
+|---|---|
+| `List<PartitionMove> plan(capability, currentPrimaries, targetPrimaries)` | 遍历目标环：target ≠ current 的分区产出 `PartitionMove(capability, partition, from, to)`（from 可 null=新增分区）；按 partition 升序 —— **最小差集**语义 |
+| `boolean shouldRebalance(movedCount, totalPartitions, minMoveRatio, lastRunMs, cooldownMs, nowMs)` | `moveRatio < minMoveRatio` → false（不值得切）；`now − lastRun < cooldown` → false（冷却期）；边界用 `>=`/`<` 严格区分 |
+
+`PartitionMove(String capability, int partition, NodeId from, NodeId to)` record。
+
+## 4. 布局算法：key → partition → owner 完整链路
+
+```
+key
+ │ Partitioner.partition(key, 4096)         MD5 前 8 字节 % 4096
+ ▼
+partition
+ │ PlacementEngine.computePrimaries         input="P%06d"，score=-ln(h)×weight
+ ▼                                            按分数降序 → PRIMARY（RF>1 时续取 REPLICA）
+PlacementStore（rt_partition_placement，epoch=0）
+ │ 运行期 MigrationEngine CUTOVER：
+ │ cutover(cap, partition, toNode, expectedEpoch)   CAS，epoch+1
+ ▼
+当前 owner = (node, epoch)
+ │ 能力写入前 fencing：PlacementView.owner()
+ │ 校验 属主存在 ∧ 属主==self ∧ epoch==expectedEpoch
+ ▼
+写入通过 / StaleEpochException 拒绝
+```
+
+加权性质实测：等权 3 节点各约 1/3（±5%）；权重 1:2 各约 1/3 与 2/3（±5%）。
+
+## 5. 数据库表（`sql/rt_placement.sql`）
+
+### rt_partition_placement
+
+| 列 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| capability | VARCHAR(16) | NOT NULL, PK(1) | 能力命名空间 |
+| partition_id | INT | NOT NULL, PK(2) | 分区号（每分区至多一条放置行） |
+| node_id | VARCHAR(64) | NOT NULL | 放置目标节点 |
+| role | VARCHAR(8) | NOT NULL | PRIMARY/REPLICA |
+| epoch | BIGINT | NOT NULL DEFAULT 0 | 纪元（replaceAll 置 0，cutover +1） |
+| updated_at | BIGINT | nullable | 更新时间戳（JDBC 实现取 System.currentTimeMillis，未注入 Clock） |
+
+`PlacementSchema.bootstrap`：advisory lock `pg_advisory_lock(4001, 3)` 串行化。
+
+## 6. 与其他模块的关系
+
+- 依赖 common；
+- scheduler 消费：`primaries` 读当前环 / `computePrimaries` 算目标环 / `RebalancePlanner` 决策 / `cutover` 切主（经 MigrationCoordinator）；
+- migration 消费：`cutover`（CUTOVER 阶段 CAS 切主）+ `PartitionMove` + `Partitioner`；
+- capability 经 server 的 `PlacementViewAdapter` 间接消费（owner 查询做 fencing）。
+
+## 7. 测试覆盖
+
+| 测试类 | 覆盖点 |
+|---|---|
+| `WeightedRendezvousHashTest` | 与 `HrwBootstrapStub`（**刻意不引用生产代码的独立数学复刻**）逐分区一致（4096 分区、等权/混合权重）；等权三节点各 ~1/3、双权节点 ~2/3（±5%）；selectNodes 降序/截断/边界/无重复/top2 与 top3 前缀一致 |
+| `PartitionerTest` | 同 key 同 count 稳定；结果 ∈ [0,count)（count ∈ {1,2,7,64,4096}）；count=1 恒 0；不同 key 覆盖全分区；count<=0 拒绝 |
+| `PlacementEngineTest` | PRIMARY 在前/epoch=0/primary≠replica；空节点空 map；RF 超节点数截断；computePrimaries 与 stub 数学一致；与 compute 首元素一致 |
+| `RebalancePlannerTest` | 新增节点 C 后计划只含 from→C 且约 1/3 移动（±15%）；未变分区不出现在计划；新增分区 from=null；环相同返回空；shouldRebalance 边界全组合 |
+| `InMemoryPlacementStoreTest` | replaceAll 一致性/原子整体替换/拒绝重复分区；未知返回 empty；cutover 成功 epoch+1/旧 epoch 失败/同 node false；**100 轮 × 2 线程并发 cutover 每轮恰一赢家**（CyclicBarrier） |

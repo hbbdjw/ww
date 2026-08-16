@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.ww</groupId>
+        <artifactId>ww</artifactId>
+        <version>1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>runtime-parent</artifactId>
+    <packaging>pom</packaging>
+    <name>runtime-parent</name>
+    <description>distributed-runtime 基础框架聚合模块（Spring-free 核心 + server 组装层）</description>
+
+    <!-- Netty 统一钉版：grpc-netty 1.62.x 需要 Netty 4.1.x；继承链上游（Spring Boot 4 BOM）
+         管理的 4.2.x 会破坏 HTTP/2 流式传输（HPACK 解码错误/巨型消息）。
+         本 dependencyManagement 声明在继承的 Spring Boot 依赖管理之后，覆盖全部 runtime-* 模块。 -->
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>io.netty</groupId>
+                <artifactId>netty-bom</artifactId>
+                <version>4.1.100.Final</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <modules>
+        <module>common</module>
+        <module>proto</module>
+        <module>cluster</module>
+        <module>membership</module>
+        <module>capability</module>
+        <module>placement</module>
+        <module>scheduler</module>
+        <module>migration</module>
+        <module>log</module>
+        <module>data</module>
+        <module>server</module>
+    </modules>
+</project>

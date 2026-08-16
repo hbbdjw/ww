@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+package runtime.v1;
+
+option java_package = "com.ww.runtime.proto";
+option java_multiple_files = true;
+
+message HealthReq {
+}
+
+message HealthRes {
+  bool healthy = 1;
+  string detail = 2;
+}
+
+// 健康检查
+service Health {
+  rpc Check(HealthReq) returns (HealthRes);
+}

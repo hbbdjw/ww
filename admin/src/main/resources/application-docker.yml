@@ -1,0 +1,36 @@
+# Docker 环境覆盖：PostgreSQL + 集群节点使用容器服务名
+spring:
+  datasource:
+    # 容器内通过 host.docker.internal 访问宿主机上的 PostgreSQL（端口 54321）
+    # docker-compose.yml 已配置 extra_hosts: host.docker.internal:host-gateway
+    url: jdbc:p6spy:postgresql://host.docker.internal:5432/ww?currentSchema=public&preferQueryMode=simple
+    username: postgres
+    password: jw3344...
+    driver-class-name: com.p6spy.engine.spy.P6SpyDriver
+
+# 集群配置 —— 容器间通过 Docker DNS 服务名互访
+cluster:
+  enabled: true
+  replicas: 2
+  # 启用动态成员管理（gossip 节点发现 + 心跳探测），集群部署必须开启
+  membership-enabled: true
+  # 启用 failover 自动检测
+  failover-enabled: true
+  # 启用数据重平衡
+  rebalance-enabled: true
+  # 心跳探测周期（毫秒）
+  heartbeat-interval-ms: 5000
+  suspect-threshold: 2
+  dead-threshold: 3
+  # rebalance 扫描周期（秒）
+  rebalance-scan-interval-sec: 30
+  nodes:
+    - host: ww-admin-node1
+      port: 8701
+      weight: 1.0
+    - host: ww-admin-node2
+      port: 8702
+      weight: 1.0
+    - host: ww-admin-node3
+      port: 8703
+      weight: 1.0
