@@ -6,9 +6,9 @@ import com.ww.runtime.common.NodeId;
 import com.ww.runtime.common.PartitionId;
 import com.ww.runtime.common.RuntimeFrameworkException;
 import com.ww.runtime.common.StaleEpochException;
-import com.ww.storage.ObjectMetadata;
-import com.ww.storage.ObjectStore;
-import com.ww.storage.StorageProperties;
+import com.ww.runtime.data.storage.engine.ObjectMetadata;
+import com.ww.runtime.data.storage.engine.ObjectStore;
+import com.ww.runtime.data.storage.engine.StorageProperties;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -18,6 +18,8 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Optional;
 
@@ -57,6 +59,13 @@ class StorageCapabilityTest {
         props.setDrives(List.of(drive.toString()));
         props.setRootDir(drive.toString());
         return props;
+    }
+
+    /** 物化惰性导出流（测试断言用）。 */
+    private static List<byte[]> drain(Iterator<byte[]> chunks) {
+        List<byte[]> all = new ArrayList<>();
+        chunks.forEachRemaining(all::add);
+        return all;
     }
 
     // ---- fencing ----
@@ -127,7 +136,7 @@ class StorageCapabilityTest {
         putObj("b1", "k2", "tiny");
 
         // bucket 首字母 'b' → 分区 1
-        List<byte[]> chunks = capability.exportPartition(1, 0L);
+        List<byte[]> chunks = drain(capability.exportPartition(1, 0L));
         assertThat(chunks).hasSize(5); // k1 四片 + k2 一片
 
         // 导入到“另一节点”实例
@@ -158,7 +167,7 @@ class StorageCapabilityTest {
         assertThat(capability.partitionCount(1)).isEqualTo(2L);
 
         // 跳过第 1 个对象（checkpoint=1）→ 只剩 k2 的分片
-        List<byte[]> chunks = capability.exportPartition(1, 1L);
+        List<byte[]> chunks = drain(capability.exportPartition(1, 1L));
         StorageChunkView first = StorageChunkCodec.decodeChunk(chunks.get(0));
         assertThat(first).isNotNull();
         assertThat(first.key()).isEqualTo("k2");
@@ -168,7 +177,7 @@ class StorageCapabilityTest {
     @Test
     void importRejectsBrokenChunks() throws IOException {
         putObj("b1", "k1", "0123456789");
-        List<byte[]> chunks = capability.exportPartition(1, 0L);
+        List<byte[]> chunks = drain(capability.exportPartition(1, 0L));
         assertThat(chunks).hasSize(2);
 
         StorageCapability target = new StorageCapability(
@@ -196,10 +205,244 @@ class StorageCapabilityTest {
         assertThat(capability.head("c1", "k9")).isNotNull(); // 其他分区不受影响
     }
 
+    // ---- S3 语义补全（阶段三）----
+
+    @Test
+    void putObjectStoresUserMetadata() throws IOException {
+        byte[] bytes = "with-meta".getBytes(StandardCharsets.UTF_8);
+        capability.putObject("b1", "k1", new ByteArrayInputStream(bytes), bytes.length,
+                "application/json", java.util.Map.of("x-amz-meta-owner", "alice"));
+
+        ObjectMetadata meta = capability.head("b1", "k1");
+        assertThat(meta.getUserMetadata()).containsEntry("x-amz-meta-owner", "alice");
+        assertThat(meta.getContentType()).isEqualTo("application/json");
+    }
+
+    @Test
+    void putObjectRejectsKnownOversize() {
+        assertThatThrownBy(() -> capability.putObject("b1", "k1",
+                new ByteArrayInputStream(new byte[0]), Long.MAX_VALUE, "text/plain", null))
+                .isInstanceOf(RuntimeFrameworkException.class)
+                .hasMessageContaining("max size");
+    }
+
+    @Test
+    void putObjectRejectsUnknownLengthOversizeByStreamLimit() {
+        StorageProperties p = props(tempDir.resolve("limited"));
+        p.setMaxObjectSize(8L);
+        StorageCapability capped = new StorageCapability(SELF, view,
+                StorageCapabilityTest::partitioner, p, 4);
+        capped.start();
+        byte[] big = "0123456789abcdef".getBytes(StandardCharsets.UTF_8); // 16B > 8B
+        // length=-1（未知长度）→ SizeLimitedInputStream 兜底拒绝
+        assertThatThrownBy(() -> capped.putObject("b1", "k1",
+                new ByteArrayInputStream(big), -1L, "text/plain", null))
+                .isInstanceOf(com.ww.runtime.data.storage.engine.StorageException.class)
+                .hasMessageContaining("max size");
+        assertThat(capped.head("b1", "k1")).isNull();
+    }
+
+    @Test
+    void bucketRegistryRecoversFromDiskOnRestart() {
+        capability.createBucketLocal("persist-bucket");
+        putObjRoundTripIgnoreFence();
+        assertThat(capability.registeredBuckets()).contains("persist-bucket");
+
+        // 重启（stop→start）：桶注册表从盘上 .bucket 重建
+        capability.stop();
+        capability.start();
+        assertThat(capability.registeredBuckets()).contains("persist-bucket");
+        assertThat(capability.listBuckets()).contains("persist-bucket");
+    }
+
+    @Test
+    void metadataIndexRebuildsFromDiskOnRestart() throws IOException {
+        putObj("b1", "a", "v");
+        putObj("b1", "b", "v");
+        putObj("b1", "ba", "v");
+        putObj("b1", "bb", "v");
+        putObj("b1", "c", "v");
+
+        // 重启（stop→start）：元数据索引从盘上 object.meta 一次性重建
+        capability.stop();
+        capability.start();
+
+        assertThat(capability.listAllObjects("b1")).extracting(ObjectMetadata::getKey)
+                .containsExactly("a", "b", "ba", "bb", "c");
+        assertThat(capability.countObjects("b1")).isEqualTo(5L);
+        // prefix 为 startsWith 语义（重建后不变）："b" 匹配 b/ba/bb，不含 "c"
+        var page = capability.list("b1", "b", null, 100);
+        assertThat(page.getObjects()).extracting(ObjectMetadata::getKey).containsExactly("b", "ba", "bb");
+    }
+
+    /** 桶持久化用例辅助：放一个对象使 bucket 目录有内容（分区 1 属主=SELF 已在 setUp 配置）。 */
+    private void putObjRoundTripIgnoreFence() {
+        try {
+            putObj("persist-bucket", "k1", "seed");
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    @Test
+    void deleteBucketLocalClearsBucketAndRegistry() throws IOException {
+        capability.createBucketLocal("gone");
+        putObj("gone", "k1", "v");
+        assertThat(capability.head("gone", "k1")).isNotNull();
+
+        capability.deleteBucketLocal("gone", true);
+        assertThat(capability.registeredBuckets()).doesNotContain("gone");
+        assertThat(capability.head("gone", "k1")).isNull(); // 缓存随桶失效
+    }
+
+    @Test
+    void deletePrefixRemovesMatchingKeysOnly() throws IOException {
+        putObj("b1", "logs/a", "v");
+        putObj("b1", "logs/b", "v");
+        putObj("b1", "keep-c", "v");
+
+        long deleted = capability.deletePrefix("b1", "logs/");
+        assertThat(deleted).isEqualTo(2L);
+        assertThat(capability.head("b1", "logs/a")).isNull();
+        assertThat(capability.head("b1", "logs/b")).isNull();
+        assertThat(capability.head("b1", "keep-c")).isNotNull();
+    }
+
+    @Test
+    void headCacheInvalidatedAfterDelete() throws IOException {
+        putObj("b1", "k1", "v1");
+        assertThat(capability.head("b1", "k1")).isNotNull(); // 写穿缓存
+        assertThat(capability.deleteObject("b1", "k1")).isTrue();
+        assertThat(capability.head("b1", "k1")).isNull(); // 删除失效缓存后回源
+    }
+
+    @Test
+    void replicaPutAndReplicaDeleteBypassFencing() throws IOException {
+        // 副本路径：owner 是 OTHER 也能落盘（非属主节点接收复制）
+        view.owner = Optional.of(new PlacementView.Owner(OTHER, 3L));
+        byte[] bytes = "replica-data".getBytes(StandardCharsets.UTF_8);
+        ObjectMetadata primaryMeta = new ObjectMetadata("k1", bytes.length, "text/plain",
+                "etag-x", 12345L, 7L);
+        ObjectMetadata stored = capability.replicaPut("b1", "k1",
+                new ByteArrayInputStream(bytes), primaryMeta);
+        assertThat(stored.getVersion()).isEqualTo(7L); // 主预计算 version 原样落盘
+
+        assertThat(capability.replicaDelete("b1", "k1")).isTrue();
+        assertThat(capability.head("b1", "k1")).isNull();
+    }
+
+    @Test
+    void replicaPutRejectsNewOversizeWrite() {
+        StorageProperties p = props(tempDir.resolve("replica-cap1"));
+        p.setMaxObjectSize(8L);
+        StorageCapability capped = new StorageCapability(SELF, view,
+                StorageCapabilityTest::partitioner, p, 4);
+        capped.start();
+        byte[] big = new byte[16]; // 16B > 8B 上限
+        ObjectMetadata meta = new ObjectMetadata("k1", big.length, "text/plain", "etag", 1L, 3L);
+
+        assertThatThrownBy(() -> capped.replicaPut("b1", "k1",
+                new ByteArrayInputStream(big), meta))
+                .isInstanceOf(com.ww.runtime.data.storage.engine.StorageException.class)
+                .hasMessageContaining("max size");
+        assertThat(capped.head("b1", "k1")).isNull();
+    }
+
+    @Test
+    void replicaPutIdempotentSkipPrecedesSizeCheck() throws IOException {
+        StorageProperties p = props(tempDir.resolve("replica-cap2"));
+        p.setMaxObjectSize(8L);
+        StorageCapability capped = new StorageCapability(SELF, view,
+                StorageCapabilityTest::partitioner, p, 4);
+        capped.start();
+
+        // 合法存量小对象（版本 5）
+        byte[] small = "tiny".getBytes(StandardCharsets.UTF_8);
+        ObjectMetadata v5 = new ObjectMetadata("k1", small.length, "text/plain", "etag-s", 1L, 5L);
+        capped.replicaPut("b1", "k1", new ByteArrayInputStream(small), v5);
+
+        // 冗余重放：版本不高于既有（5），但自报超限尺寸——应幂等跳过而非被大小拒绝
+        ObjectMetadata replay = new ObjectMetadata("k1", 9999L, "text/plain", "etag-s", 1L, 5L);
+        ObjectMetadata stored = capped.replicaPut("b1", "k1",
+                new ByteArrayInputStream(new byte[0]), replay);
+        assertThat(stored.getVersion()).isEqualTo(5L);
+        assertThat(capped.head("b1", "k1").getSize()).isEqualTo(small.length); // 数据未被覆盖
+    }
+
+    @Test
+    void importChunksRejectsOversizeAggregation() throws IOException {
+        // 源端正常上限：导出 20B 对象（chunkSize=8 → 8/8/4 三片，末片 fin）
+        putObj("b1", "k1", "0123456789abcdefghij");
+        List<byte[]> chunks = drain(capability.exportPartition(1, 0L));
+        assertThat(chunks).hasSize(3);
+
+        // 目标端上限 8B：聚合累计超限即失败，不整对象入堆
+        StorageProperties p = props(tempDir.resolve("import-cap"));
+        p.setMaxObjectSize(8L);
+        StorageCapability target = new StorageCapability(OTHER,
+                (cap, partition) -> Optional.of(new PlacementView.Owner(OTHER, 3L)),
+                StorageCapabilityTest::partitioner, p, 8);
+        target.start();
+        assertThat(target.importChunks(chunks)).isFalse();
+        assertThat(target.head("b1", "k1")).isNull();
+    }
+
+    @Test
+    void listAllObjectsReturnsEveryKey() throws IOException {
+        putObj("b1", "a", "v");
+        putObj("b1", "b", "v");
+        putObj("b1", "c", "v");
+        List<ObjectMetadata> all = capability.listAllObjects("b1");
+        assertThat(all).extracting(ObjectMetadata::getKey).containsExactly("a", "b", "c");
+    }
+
+    // ---- 动态调度：清扫 / 属主探测 / 计数 ----
+
+    @Test
+    void retainPartitionsRemovesUnownedAndInvalidatesCache() throws IOException {
+        putObj("b1", "k1", "keep");  // 分区 1（桶首字母 'b'）
+        putObj("c1", "k9", "sweep"); // 分区 2（'c'）
+        assertThat(capability.head("c1", "k9")).isNotNull(); // 预热写穿缓存
+
+        long removed = capability.retainPartitions(p -> p == 1);
+        assertThat(removed).isEqualTo(1L);
+        assertThat(capability.partitionCount(1)).isEqualTo(1L); // 保留分区不受影响
+        assertThat(capability.partitionCount(2)).isZero();
+        assertThat(capability.head("b1", "k1")).isNotNull();
+        assertThat(capability.head("c1", "k9")).isNull(); // 元数据缓存同步失效
+    }
+
+    @Test
+    void retainPartitionsNoOpWhenNotStarted() {
+        StorageCapability stopped = new StorageCapability(SELF, view,
+                StorageCapabilityTest::partitioner, props(tempDir.resolve("idle")), 8);
+        assertThat(stopped.retainPartitions(p -> true)).isZero();
+    }
+
+    @Test
+    void objectCountApisCoverAllAndPerBucket() throws IOException {
+        putObj("b1", "k1", "v");
+        putObj("b1", "k2", "v");
+        putObj("c1", "k9", "v");
+        assertThat(capability.totalObjectCount()).isEqualTo(3L);
+        assertThat(capability.countObjects("b1")).isEqualTo(2L);
+        assertThat(capability.countObjects("c1")).isEqualTo(1L);
+    }
+
+    @Test
+    void servesPartitionOfReflectsPlacement() {
+        view.owner = Optional.of(new PlacementView.Owner(SELF, 3L));
+        assertThat(capability.servesPartitionOf("b1", "k1")).isTrue();
+        view.owner = Optional.of(new PlacementView.Owner(OTHER, 3L));
+        assertThat(capability.servesPartitionOf("b1", "k1")).isFalse();
+        view.owner = Optional.empty(); // 无放置 → 单机退化
+        assertThat(capability.servesPartitionOf("b1", "k1")).isTrue();
+    }
+
     private ObjectMetadata putObj(String bucket, String key, String data) throws IOException {
         byte[] bytes = data.getBytes(StandardCharsets.UTF_8);
         return capability.putObject(bucket, key, new ByteArrayInputStream(bytes),
-                bytes.length, "text/plain");
+                bytes.length, "text/plain", null);
     }
 
     /** 可变桩视图。 */
