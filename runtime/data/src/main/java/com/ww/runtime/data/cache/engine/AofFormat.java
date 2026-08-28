@@ -1,8 +1,10 @@
 package com.ww.runtime.data.cache.engine;
 
 import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.util.Arrays;
 import java.util.zip.CRC32;
 
@@ -142,5 +144,175 @@ public final class AofFormat {
         result[data.length + 2] = (byte) (crcValue >>> 8);
         result[data.length + 3] = (byte) crcValue;
         return result;
+    }
+
+    // ==================== 记录解析 ====================
+
+    /** 结构性损坏：记录边界/长度/编码异常，后续记录不可信（区别于单条毒记录）。 */
+    public static class AofFormatException extends IOException {
+        public AofFormatException(String message) {
+            super(message);
+        }
+    }
+
+    /** CRC 校验失配：记录体字节在盘上被破坏。 */
+    public static final class AofCrcMismatchException extends AofFormatException {
+        public AofCrcMismatchException(String message) {
+            super(message);
+        }
+    }
+
+    /** 一条解析完成的 AOF 记录。 */
+    public static final class Record {
+        private final byte opCode;
+        private final String key;
+        private final Object[] args;
+
+        Record(byte opCode, String key, Object[] args) {
+            this.opCode = opCode;
+            this.key = key;
+            this.args = args;
+        }
+
+        public byte opCode() { return opCode; }
+        public String key() { return key; }
+        public Object[] args() { return args; }
+    }
+
+    /**
+     * 边读边累加 CRC 的 tee 流：记录布局无长度前缀，只能在解析过程中捕获原始字节。
+     * {@code armed} 关闭时读过的字节不计入 CRC（用于跳过尾部存储的 4 字节 CRC）。
+     */
+    static final class CrcTeeInputStream extends java.io.FilterInputStream {
+
+        private final java.util.zip.CRC32 crc = new java.util.zip.CRC32();
+        private long bytesRead;
+        private boolean armed = true;
+
+        CrcTeeInputStream(InputStream in) {
+            super(in);
+        }
+
+        @Override
+        public int read() throws IOException {
+            int b = in.read();
+            if (b >= 0) {
+                bytesRead++;
+                if (armed) crc.update(b);
+            }
+            return b;
+        }
+
+        @Override
+        public int read(byte[] b, int off, int len) throws IOException {
+            int n = in.read(b, off, len);
+            if (n > 0) {
+                bytesRead += n;
+                if (armed) crc.update(b, off, n);
+            }
+            return n;
+        }
+
+        void beginRecord() {
+            crc.reset();
+            armed = true;
+        }
+
+        void setArmed(boolean armed) {
+            this.armed = armed;
+        }
+
+        long crcValue() {
+            return crc.getValue();
+        }
+
+        /** 累计读过的绝对字节数（含文件头），整条记录成功后即文件内完好边界。 */
+        long bytesRead() {
+            return bytesRead;
+        }
+    }
+
+    /**
+     * AOF 文件读取器：封装文件头与记录的解析、CRC 校验与偏移追踪。
+     *
+     * <p>异常语义：
+     * <ul>
+     *   <li>{@link EOFException}——尾部残记录（崩溃写一半），截断回放；</li>
+     *   <li>{@link AofCrcMismatchException}——CRC 失配，截断回放；</li>
+     *   <li>{@link AofFormatException}——其他结构性损坏（负长度/解码失败/标记错位），截断回放；</li>
+     * </ul>
+     * 以上均属结构性损坏，由调用方决定截断；单条毒记录（CRC 完好但应用失败）
+     * 不在此处暴露，由回放应用层的 RuntimeException 容错处理。
+     */
+    public static final class Reader implements java.io.Closeable {
+
+        private final CrcTeeInputStream tee;
+        private final DataInputStream in;
+
+        public Reader(InputStream source) {
+            this.tee = new CrcTeeInputStream(source);
+            this.in = new DataInputStream(tee);
+        }
+
+        public int readMagic() throws IOException {
+            return in.readInt();
+        }
+
+        public int available() throws IOException {
+            return in.available();
+        }
+
+        /** 当前完好字节边界（每条记录完整读取成功后推进）。 */
+        public long bytesRead() {
+            return tee.bytesRead();
+        }
+
+        public Record readRecord() throws IOException {
+            tee.beginRecord();
+
+            byte marker = in.readByte();
+            if (marker != CMD_MARKER) {
+                throw new AofFormatException("marker 不匹配: 0x" + Integer.toHexString(marker & 0xFF));
+            }
+            byte opCode = in.readByte();
+
+            int keyLen = in.readUnsignedShort();
+            byte[] keyBytes = new byte[keyLen];
+            in.readFully(keyBytes);
+            String key = new String(keyBytes, java.nio.charset.StandardCharsets.UTF_8);
+
+            int argCount = in.readUnsignedShort();
+            Object[] args = new Object[argCount];
+            for (int i = 0; i < argCount; i++) {
+                int argLen = in.readInt();
+                if (argLen < 0) {
+                    throw new AofFormatException("负参数长度: " + argLen);
+                }
+                byte[] argBytes = new byte[argLen];
+                in.readFully(argBytes);
+                try {
+                    args[i] = Codec.decodeValue(argBytes);
+                } catch (RuntimeException e) {
+                    throw new AofFormatException("参数 " + i + " 解码失败: " + e);
+                }
+            }
+
+            tee.setArmed(false);
+            int storedCrc = in.readInt();
+            tee.setArmed(true);
+            int computedCrc = (int) tee.crcValue();
+            if (storedCrc != computedCrc) {
+                throw new AofCrcMismatchException(
+                        "CRC 失配: op=" + opName(opCode) + ", key=" + key
+                                + ", stored=0x" + Integer.toHexString(storedCrc)
+                                + ", computed=0x" + Integer.toHexString(computedCrc));
+            }
+            return new Record(opCode, key, args);
+        }
+
+        @Override
+        public void close() throws IOException {
+            in.close();
+        }
     }
 }

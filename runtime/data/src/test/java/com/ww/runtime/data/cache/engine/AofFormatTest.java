@@ -110,6 +110,25 @@ class AofFormatTest {
     }
 
     @Test
+    @DisplayName("Reader 往返：编码记录经解析完整还原，CRC 校验生效")
+    void readerRoundTripAndCrcEnforced() throws IOException {
+        byte[] record = AofFormat.encodeCommand(AofFormat.OP_HSET, "h1", "field", 42L);
+
+        AofFormat.Reader reader = new AofFormat.Reader(new ByteArrayInputStream(record));
+        AofFormat.Record parsed = reader.readRecord();
+        assertThat(parsed.opCode()).isEqualTo(AofFormat.OP_HSET);
+        assertThat(parsed.key()).isEqualTo("h1");
+        assertThat(parsed.args()).containsExactly("field", 42L);
+
+        // 篡改值区一字节：CRC 失配必须响亮失败
+        byte[] corrupted = record.clone();
+        corrupted[corrupted.length - 5] ^= (byte) 0xFF;
+        AofFormat.Reader badReader = new AofFormat.Reader(new ByteArrayInputStream(corrupted));
+        org.assertj.core.api.Assertions.assertThatThrownBy(badReader::readRecord)
+                .isInstanceOf(AofFormat.AofCrcMismatchException.class);
+    }
+
+    @Test
     @DisplayName("opCode 与 opName 全量互逆，未知操作分别返回 -1 与 UNKNOWN")
     void opCodeNameMapping() {
         String[] ops = {

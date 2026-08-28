@@ -5,7 +5,6 @@ import org.slf4j.LoggerFactory;
 
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
-import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
@@ -276,10 +275,23 @@ public class AofService {
             public boolean test(String k) {
                 return true;
             }
-        });
+        }, true);
     }
 
     public void replay(Cache<String, Object> cache, java.util.function.Predicate<String> keyFilter) {
+        replay(cache, keyFilter, false);
+    }
+
+    /**
+     * @param truncateOnCorruption 结构性损坏（CRC 失配/尾部残记录）时是否把文件物理截断到
+     *                             最后一条完好记录边界。不截断则后续追加写在损坏尾部之后，
+     *                             新记录永远无法通过回放边界，等于持续静默丢数据。
+     *                             <p>仅全量回放路径允许：调用前提为文件已由 {@link #start()}
+     *                             打开且无并发写（截断经同一裸流 channel 完成，之后追加写
+     *                             自然落在新边界）。谓词回放只覆盖部分 key，不得动文件。
+     */
+    private void replay(Cache<String, Object> cache, java.util.function.Predicate<String> keyFilter,
+                        boolean truncateOnCorruption) {
         if (!properties.isEnabled()) return;
         if (!aofFile.exists() || aofFile.length() <= 4) {
             log.info("AOF回放完成：无日志记录");
@@ -290,64 +302,72 @@ public class AofService {
         int applied = 0;
         int filtered = 0;
         int corrupted = 0;
+        long lastGoodOffset = 0;
+        boolean structuralCorruption = false;
+        String corruptionReason = null;
 
-        try (DataInputStream in = new DataInputStream(
+        try (AofFormat.Reader reader = new AofFormat.Reader(
                 new BufferedInputStream(new FileInputStream(aofFile), 65536))) {
-            int magic = in.readInt();
+            int magic = reader.readMagic();
             if (magic != AofFormat.AOF_MAGIC) {
                 log.error("AOF文件魔数不匹配，期望 {:x}，实际 {:x}", AofFormat.AOF_MAGIC, magic);
                 return;
             }
+            lastGoodOffset = reader.bytesRead();
 
-            while (in.available() > 0) {
+            while (reader.available() > 0) {
+                AofFormat.Record record;
                 try {
-                    byte marker = in.readByte();
-                    if (marker != AofFormat.CMD_MARKER) {
-                        log.warn("AOF记录位置 {} marker不匹配，跳过", applied + filtered);
-                        break;
-                    }
-
-                    byte opCode = in.readByte();
-                    int keyLen = in.readUnsignedShort();
-                    byte[] keyBytes = new byte[keyLen];
-                    in.readFully(keyBytes);
-                    String key = new String(keyBytes, java.nio.charset.StandardCharsets.UTF_8);
-
-                    int argCount = in.readUnsignedShort();
-                    Object[] args = new Object[argCount];
-                    for (int i = 0; i < argCount; i++) {
-                        int argLen = in.readInt();
-                        byte[] argBytes = new byte[argLen];
-                        in.readFully(argBytes);
-                        args[i] = Codec.decodeValue(argBytes);
-                    }
-
-                    in.readInt(); // stored CRC
-
-                    if (keyFilter != null && !keyFilter.test(key)) {
-                        filtered++;
-                        continue;
-                    }
-
-                    try {
-                        replayCommand(cache, opCode, key, args);
-                        applied++;
-                    } catch (RuntimeException poison) {
-                        // CRC 完好的单条毒记录（如存量 ZSet 被误写为 OP_HSET）：
-                        // 跳过 + 告警 + 计数，后续记录边界仍可信，不中断回放；
-                        // 结构性损坏（解析失败）归 IOException 分支处理
-                        poisonRecordsSkipped.incrementAndGet();
-                        log.error("AOF毒记录跳过：op={}, key={}, err={}",
-                                AofFormat.opName(opCode), key, poison.toString());
-                    }
-                } catch (IOException e) {
+                    record = reader.readRecord();
+                } catch (java.io.EOFException eof) {
+                    // 尾部残记录（崩溃写一半）：后续记录边界不可信，停止回放
                     corrupted++;
-                    log.error("AOF回放损坏，在位置 {} 停止", applied + filtered, e);
+                    structuralCorruption = true;
+                    crcFailures.incrementAndGet();
+                    corruptionReason = "尾部残记录";
+                    log.error("AOF尾部残记录（位置 {}），停止回放并截断", applied + filtered);
                     break;
+                } catch (AofFormat.AofFormatException bad) {
+                    // 结构性损坏（含 CRC 失配）：与单条毒记录区分，不得跳过续读
+                    corrupted++;
+                    structuralCorruption = true;
+                    crcFailures.incrementAndGet();
+                    corruptionReason = bad.getMessage();
+                    log.error("AOF回放结构性损坏（位置 {}）：{}", applied + filtered, bad.getMessage());
+                    break;
+                }
+                lastGoodOffset = reader.bytesRead();
+
+                if (keyFilter != null && !keyFilter.test(record.key())) {
+                    filtered++;
+                    continue;
+                }
+
+                try {
+                    replayCommand(cache, record.opCode(), record.key(), record.args());
+                    applied++;
+                } catch (RuntimeException poison) {
+                    // CRC 完好的单条毒记录（如存量 ZSet 被误写为 OP_HSET）：
+                    // 跳过 + 告警 + 计数，后续记录边界仍可信，不中断回放
+                    poisonRecordsSkipped.incrementAndGet();
+                    log.error("AOF毒记录跳过：op={}, key={}, err={}",
+                            AofFormat.opName(record.opCode()), record.key(), poison.toString());
                 }
             }
         } catch (IOException e) {
             log.error("AOF文件读取失败", e);
+        }
+
+        if (structuralCorruption && truncateOnCorruption && aofRawOut != null) {
+            try {
+                long before = aofFile.length();
+                aofRawOut.getChannel().truncate(lastGoodOffset);
+                aofFileSize = lastGoodOffset;
+                log.error("AOF已截断至最后完好记录边界：{} -> {} 字节（丢弃 {} 字节，原因：{}）",
+                        before, lastGoodOffset, before - lastGoodOffset, corruptionReason);
+            } catch (IOException e) {
+                log.error("AOF截断失败", e);
+            }
         }
 
         log.info("AOF回放完成：应用 {} 条，跳过 {} 条非owner，损坏 {} 条，毒记录跳过 {} 条",

@@ -190,6 +190,123 @@ class AofServiceTest {
     }
 
     @Test
+    @DisplayName("C5：中段 CRC 失配停止回放并截断，截断后新写入可回放")
+    void crcMismatchTruncatesAndAllowsFutureWrites() throws Exception {
+        // 写入三条完好记录
+        AofProperties p = props();
+        SimpleCache<String, Object> cache = new SimpleCache<>();
+        AofService aof = new AofService(p, cache);
+        aof.start();
+        cache.setAofService(aof);
+        cache.put("k1", "v1");
+        cache.put("k2", "v2");
+        cache.put("k3", "v3");
+        aof.stop();
+
+        // 翻转第二条记录值区一字节（CRC 失配但可解码，确保走校验分支而非解析分支）
+        File aofFile = new File(dir, "appendonly.aof");
+        byte[] rec1 = AofFormat.encodeCommand(AofFormat.OP_PUT, "k1", "v1");
+        byte[] rec2 = AofFormat.encodeCommand(AofFormat.OP_PUT, "k2", "v2");
+        int corruptAt = 4 + rec1.length + (rec2.length - 5);
+        try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(aofFile, "rw")) {
+            raf.seek(corruptAt);
+            int b = raf.read();
+            raf.seek(corruptAt);
+            raf.write(b ^ 0xFF);
+        }
+
+        // 全量回放：停止于损坏点前 + 物理截断到最后完好边界
+        SimpleCache<String, Object> restored = new SimpleCache<>();
+        AofService aof2 = new AofService(p, restored);
+        aof2.start();
+        aof2.replay(restored);
+        assertThat(restored.get("k1")).isEqualTo("v1");
+        assertThat(restored.get("k2")).as("CRC 失配记录不得应用").isNull();
+        assertThat(restored.get("k3")).as("损坏点之后的记录不得应用").isNull();
+        assertThat(aof2.getStatus().getCrcFailures()).isEqualTo(1);
+        assertThat(aofFile.length()).as("文件应截断至第一条记录边界").isEqualTo(4 + rec1.length);
+
+        // 截断后续写应落在新边界，重启可回放（不截断则新记录永不可达）
+        restored.setAofService(aof2);
+        restored.put("k4", "v4");
+        aof2.stop();
+
+        SimpleCache<String, Object> finalCache = new SimpleCache<>();
+        AofService aof3 = new AofService(p, finalCache);
+        aof3.start();
+        aof3.replay(finalCache);
+        assertThat(finalCache.get("k1")).isEqualTo("v1");
+        assertThat(finalCache.get("k4")).isEqualTo("v4");
+        assertThat(finalCache.get("k2")).isNull();
+        assertThat(finalCache.get("k3")).isNull();
+        aof3.stop();
+    }
+
+    @Test
+    @DisplayName("C5：尾部残记录（崩溃写一半）截断至最后完好边界")
+    void truncatedTailRecordHandled() throws Exception {
+        AofProperties p = props();
+        SimpleCache<String, Object> cache = new SimpleCache<>();
+        AofService aof = new AofService(p, cache);
+        aof.start();
+        cache.setAofService(aof);
+        cache.put("k1", "v1");
+        cache.put("k2", "v2");
+        aof.stop();
+
+        // 截短文件至第二条记录中间，模拟崩溃写一半
+        File aofFile = new File(dir, "appendonly.aof");
+        byte[] rec1 = AofFormat.encodeCommand(AofFormat.OP_PUT, "k1", "v1");
+        byte[] rec2 = AofFormat.encodeCommand(AofFormat.OP_PUT, "k2", "v2");
+        try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(aofFile, "rw")) {
+            raf.setLength(4 + rec1.length + rec2.length / 2);
+        }
+
+        SimpleCache<String, Object> restored = new SimpleCache<>();
+        AofService aof2 = new AofService(p, restored);
+        aof2.start();
+        aof2.replay(restored);
+        assertThat(restored.get("k1")).isEqualTo("v1");
+        assertThat(restored.get("k2")).isNull();
+        assertThat(aof2.getStatus().getCrcFailures()).isEqualTo(1);
+        assertThat(aofFile.length()).isEqualTo(4 + rec1.length);
+        aof2.stop();
+    }
+
+    @Test
+    @DisplayName("C5：谓词回放路径遇损坏仅停止，不得改动文件")
+    void predicateReplayDoesNotTruncate() throws Exception {
+        AofProperties p = props();
+        SimpleCache<String, Object> cache = new SimpleCache<>();
+        AofService aof = new AofService(p, cache);
+        aof.start();
+        cache.setAofService(aof);
+        cache.put("k1", "v1");
+        cache.put("k2", "v2");
+        aof.stop();
+
+        File aofFile = new File(dir, "appendonly.aof");
+        long lenBefore = aofFile.length();
+        byte[] rec1 = AofFormat.encodeCommand(AofFormat.OP_PUT, "k1", "v1");
+        int corruptAt = 4 + rec1.length + 3; // 破坏第二条记录的头部
+        try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(aofFile, "rw")) {
+            raf.seek(corruptAt);
+            int b = raf.read();
+            raf.seek(corruptAt);
+            raf.write(b ^ 0xFF);
+        }
+
+        SimpleCache<String, Object> restored = new SimpleCache<>();
+        AofService aof2 = new AofService(p, restored);
+        aof2.start();
+        aof2.replay(restored, k -> true);
+        assertThat(restored.get("k1")).isEqualTo("v1");
+        assertThat(aof2.getStatus().getCrcFailures()).isEqualTo(1);
+        assertThat(aofFile.length()).as("谓词回放不得物理截断文件").isEqualTo(lenBefore);
+        aof2.stop();
+    }
+
+    @Test
     @DisplayName("C4：always 策略每写即落盘，重启回放等价")
     void alwaysFsyncRoundTrip() throws Exception {
         AofProperties p = props();
