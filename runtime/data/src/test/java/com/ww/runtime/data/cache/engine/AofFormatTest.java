@@ -129,6 +129,16 @@ class AofFormatTest {
     }
 
     @Test
+    @DisplayName("C34：超过 64KB 的 key 编码响亮失败，不得静默截断")
+    void oversizedKeyRejectedAtEncode() {
+        String longKey = "k".repeat(70_000);
+        org.assertj.core.api.Assertions.assertThatThrownBy(
+                () -> AofFormat.encodeCommand(AofFormat.OP_PUT, longKey, "v"))
+                .isInstanceOf(java.io.IOException.class)
+                .hasMessageContaining("拒绝写入");
+    }
+
+    @Test
     @DisplayName("opCode 与 opName 全量互逆，未知操作分别返回 -1 与 UNKNOWN")
     void opCodeNameMapping() {
         String[] ops = {

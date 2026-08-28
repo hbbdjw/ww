@@ -23,6 +23,8 @@ public final class AofFormat {
 
     public static final int AOF_MAGIC = 0x414F4631; // "AOF1"
     public static final byte CMD_MARKER = 0x2A; // '*'
+    /** key 字节上限（writeShort 长度字段表达范围），超限拒绝写入而非截断 */
+    public static final int MAX_KEY_BYTES = 65535;
     static final String REWRITE_TMP_SUFFIX = ".rewrite-tmp";
 
     // ==================== 操作类型常量 ====================
@@ -117,8 +119,9 @@ public final class AofFormat {
         DataOutputStream out = new DataOutputStream(bos);
 
         byte[] keyBytes = key.getBytes(java.nio.charset.StandardCharsets.UTF_8);
-        if (keyBytes.length > 65535) {
-            keyBytes = Arrays.copyOf(keyBytes, 65535);
+        if (keyBytes.length > MAX_KEY_BYTES) {
+            throw new IOException("AOF key 超过 " + MAX_KEY_BYTES + " 字节上限（实际 "
+                    + keyBytes.length + " 字节），拒绝写入");
         }
 
         out.writeByte(CMD_MARKER);

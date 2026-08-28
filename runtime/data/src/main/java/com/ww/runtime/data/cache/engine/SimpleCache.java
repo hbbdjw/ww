@@ -227,6 +227,7 @@ public class SimpleCache<K, V> implements Cache<K, V> {
     // ==================== 事务辅助 ====================
 
     private void queueOrExec(K key, String aofOp, Object[] aofArgs, java.util.function.Supplier<Object> action) {
+        requireAofEncodableKey(key, aofOp);
         TxContext<K> tx = txHolder.get();
         if (tx != null && tx.active) {
             tx.commands.add(new QueuedCommand(action, key, aofOp, key != null ? key.toString() : "", aofArgs));
@@ -238,6 +239,7 @@ public class SimpleCache<K, V> implements Cache<K, V> {
     }
 
     private Object queueOrExecReturn(K key, String aofOp, Object[] aofArgs, java.util.function.Supplier<Object> action) {
+        requireAofEncodableKey(key, aofOp);
         TxContext<K> tx = txHolder.get();
         if (tx != null && tx.active) {
             tx.commands.add(new QueuedCommand(action, key, aofOp, key != null ? key.toString() : "", aofArgs));
@@ -249,6 +251,13 @@ public class SimpleCache<K, V> implements Cache<K, V> {
             logAof(aofOp, key, aofArgs);
         }
         return result;
+    }
+
+    /** 写操作前置：key 无法编码进 AOF 时拒绝整个操作（读操作 aofOp==null 不校验）。 */
+    private void requireAofEncodableKey(K key, String aofOp) {
+        if (aofOp != null && aofService != null) {
+            aofService.requireEncodableKey(key != null ? key.toString() : "");
+        }
     }
 
     // ==================== LRU 辅助方法（O(1)；读路径 tryLock 免阻塞） ====================

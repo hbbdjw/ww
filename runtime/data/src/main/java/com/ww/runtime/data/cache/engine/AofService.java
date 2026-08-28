@@ -72,6 +72,9 @@ public class AofService {
     /** 回放 CRC 校验失败次数（结构性损坏） */
     private final java.util.concurrent.atomic.AtomicLong crcFailures =
             new java.util.concurrent.atomic.AtomicLong();
+    /** 因 key 超过编码上限被拒绝落盘的写操作次数 */
+    private final java.util.concurrent.atomic.AtomicLong oversizedKeysRejected =
+            new java.util.concurrent.atomic.AtomicLong();
 
     public AofService(AofProperties properties, SimpleCache<String, Object> cache) {
         this.properties = properties;
@@ -185,12 +188,39 @@ public class AofService {
             return;
         }
 
+        byte[] cmdBytes;
         try {
-            byte[] cmdBytes = AofFormat.encodeCommand(opCode, cacheKey != null ? cacheKey : "", args);
+            cmdBytes = AofFormat.encodeCommand(opCode, cacheKey != null ? cacheKey : "", args);
+        } catch (IOException e) {
+            // 编码失败（典型为 key 超长）：重试无意义，拒绝该条记录 + 告警 + 计数。
+            // 不得走 handleWriteFailure（那是写盘失败的重试通道，语义不同）
+            oversizedKeysRejected.incrementAndGet();
+            log.error("AOF命令编码失败，该写操作不落盘：op={}, key={}, err={}",
+                    operation, cacheKey, e.toString());
+            return;
+        }
+
+        try {
             writeCommand(cmdBytes);
         } catch (IOException e) {
             log.error("AOF写入失败: op={}, key={}", operation, cacheKey, e);
             handleWriteFailure(e);
+        }
+    }
+
+    /**
+     * key 可编码性前置校验：写动作执行前调用，key 超过 {@link AofFormat#MAX_KEY_BYTES}
+     * 时抛 {@link IllegalArgumentException} 拒绝整个操作——避免"已写内存、无法落盘"
+     * 的静默分歧。AOF 未启用或 key 为 null 时 no-op。
+     */
+    public void requireEncodableKey(String key) {
+        if (!properties.isEnabled() || key == null) return;
+        // 快路径：每字符按 3 字节 UTF-8 上限估算仍在限内，无需真实编码
+        if (key.length() * 3L <= AofFormat.MAX_KEY_BYTES) return;
+        int bytes = key.getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+        if (bytes > AofFormat.MAX_KEY_BYTES) {
+            throw new IllegalArgumentException("key 超过 AOF 编码上限（" + bytes
+                    + " 字节 > " + AofFormat.MAX_KEY_BYTES + " 字节），写入被拒绝");
         }
     }
 
@@ -867,7 +897,8 @@ public class AofService {
         synchronized (writeLock) {
             return new AofStatus(lastFlushFailTime, consecutiveFailures,
                     rewriting ? rewriteBuffer.size() : 0, aofFileSize,
-                    rewriting, commandCount, poisonRecordsSkipped.get(), crcFailures.get());
+                    rewriting, commandCount, poisonRecordsSkipped.get(), crcFailures.get(),
+                    oversizedKeysRejected.get());
         }
     }
 
@@ -880,10 +911,11 @@ public class AofService {
         private final long totalCommands;
         private final long poisonRecordsSkipped;
         private final long crcFailures;
+        private final long oversizedKeysRejected;
 
         public AofStatus(long lastFlushFailTime, int consecutiveFailures, int bufferSize,
                          long fileSizeBytes, boolean rewriting, long totalCommands,
-                         long poisonRecordsSkipped, long crcFailures) {
+                         long poisonRecordsSkipped, long crcFailures, long oversizedKeysRejected) {
             this.lastFlushFailTime = lastFlushFailTime;
             this.consecutiveFailures = consecutiveFailures;
             this.bufferSize = bufferSize;
@@ -892,6 +924,7 @@ public class AofService {
             this.totalCommands = totalCommands;
             this.poisonRecordsSkipped = poisonRecordsSkipped;
             this.crcFailures = crcFailures;
+            this.oversizedKeysRejected = oversizedKeysRejected;
         }
 
         public long getLastFlushFailTime() { return lastFlushFailTime; }
@@ -904,5 +937,7 @@ public class AofService {
         public long getPoisonRecordsSkipped() { return poisonRecordsSkipped; }
         /** 回放 CRC 校验失败次数（结构性损坏） */
         public long getCrcFailures() { return crcFailures; }
+        /** 因 key 超过编码上限被拒绝落盘的写操作次数 */
+        public long getOversizedKeysRejected() { return oversizedKeysRejected; }
     }
 }

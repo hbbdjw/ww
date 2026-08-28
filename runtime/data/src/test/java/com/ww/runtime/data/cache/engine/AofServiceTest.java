@@ -190,6 +190,31 @@ class AofServiceTest {
     }
 
     @Test
+    @DisplayName("C34：超长 key 写入被拒绝，缓存未写入；流路径事后拒绝并计数")
+    void oversizedKeyRejected() throws Exception {
+        String longKey = "k".repeat(70_000); // UTF-8 70000 字节 > 65535 上限
+
+        AofService[] holder = new AofService[1];
+        SimpleCache<String, Object> cache = startWriting(holder);
+
+        // KV/容器路径：写动作执行前拒绝，缓存不得写入
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> cache.put(longKey, "v"))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThat(cache.get(longKey)).isNull();
+
+        // 流路径（logAof 直调）：操作已应用，编码失败事后拒绝 + 计数（阶段 3 C41 统一前置）
+        StreamId id = cache.xadd(longKey, StreamId.AUTO, Map.of("f", "v"), XAddOptions.defaults());
+        assertThat(id).isNotNull();
+        assertThat(holder[0].getStatus().getOversizedKeysRejected()).isEqualTo(1);
+        stopAof(holder[0]);
+
+        // 超长 key 的流记录未落盘：回放后该流不存在
+        SimpleCache<String, Object> restored = replayFromDisk(holder);
+        assertThat(restored.getStreamStore().streamKeys()).doesNotContain(longKey);
+        stopAof(holder[0]);
+    }
+
+    @Test
     @DisplayName("C5：中段 CRC 失配停止回放并截断，截断后新写入可回放")
     void crcMismatchTruncatesAndAllowsFutureWrites() throws Exception {
         // 写入三条完好记录

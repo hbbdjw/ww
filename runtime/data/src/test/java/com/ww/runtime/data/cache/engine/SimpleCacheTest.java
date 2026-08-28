@@ -22,6 +22,19 @@ class SimpleCacheTest {
     }
 
     @Test
+    @DisplayName("C32：损坏的巨大集合 count 解码不得 OOM，快速失败")
+    void hugeCollectionCountDoesNotOom() {
+        // TYPE_LIST + count=0x7FFFFFFF + 无元素字节：预分配不钳制则直接 OOM
+        byte[] malformed = new byte[] { 0x10, 0x7F, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF };
+
+        long start = System.nanoTime();
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> Codec.decodeValue(malformed))
+                .isInstanceOf(RuntimeException.class);
+        long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+        assertThat(elapsedMs).as("解码应立即失败而非长时间分配/循环").isLessThan(5_000);
+    }
+
+    @Test
     @DisplayName("C8：remove 清理 zset 成员反向索引")
     void removeCleansZsetIndex() throws Exception {
         SimpleCache<String, Object> cache = new SimpleCache<>();
