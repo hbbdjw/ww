@@ -46,6 +46,7 @@ public class SimpleCache<K, V> implements Cache<K, V> {
             if (size() > maxSize) {
                 store.remove(eldest.getKey());
                 versions.remove(eldest.getKey());
+                zsetMemberIndex.remove(eldest.getKey());
                 return true;
             }
             return false;
@@ -349,6 +350,7 @@ public class SimpleCache<K, V> implements Cache<K, V> {
             store.remove(key);
             versions.remove(key);
             lruRemove(key);
+            zsetMemberIndex.remove(key);
             return null;
         }
         lruTouch(key);
@@ -362,6 +364,7 @@ public class SimpleCache<K, V> implements Cache<K, V> {
             store.remove(key);
             versions.remove(key);
             lruRemove(key);
+            zsetMemberIndex.remove(key);
             // 联动清理同名的 stream，保持与 Redis DEL stream 行为一致
             if (key != null) {
                 streamStore.removeStream(key.toString());
@@ -378,6 +381,7 @@ public class SimpleCache<K, V> implements Cache<K, V> {
                 store.clear();
                 versions.clear();
                 lruClear();
+                zsetMemberIndex.clear();
                 streamStore.clear();
                 return null;
             }, null, "CLEAR", "", new Object[0]));
@@ -385,6 +389,7 @@ public class SimpleCache<K, V> implements Cache<K, V> {
         store.clear();
         versions.clear();
         lruClear();
+        zsetMemberIndex.clear();
         streamStore.clear();
         logAof("CLEAR", null);
     }
@@ -878,6 +883,7 @@ public class SimpleCache<K, V> implements Cache<K, V> {
                 it.remove();
                 versions.remove(entry.getKey());
                 lruRemove(entry.getKey());
+                zsetMemberIndex.remove(entry.getKey());
                 count++;
             }
         }
