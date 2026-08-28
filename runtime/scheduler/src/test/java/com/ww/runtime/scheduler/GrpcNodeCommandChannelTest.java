@@ -91,6 +91,56 @@ class GrpcNodeCommandChannelTest {
         assertThat(channel.freeze(NodeId.of("ghost"), CapabilityType.MOCK, true)).isFalse();
     }
 
+    @Test
+    void registryFailureReturnsFalseInsteadOfThrowing() {
+        // S18：注册表查询抛异常（如 DB 故障）不得穿透命令通道
+        com.ww.runtime.cluster.NodeRegistry failing = new com.ww.runtime.cluster.NodeRegistry() {
+            @Override
+            public Optional<NodeInfo> get(NodeId id) {
+                throw new com.ww.runtime.common.RuntimeFrameworkException("registry unavailable");
+            }
+
+            @Override
+            public void register(NodeInfo info) {
+                throw new UnsupportedOperationException();
+            }
+
+            @Override
+            public void heartbeat(NodeId id, ResourceSnapshot snapshot) {
+                throw new UnsupportedOperationException();
+            }
+
+            @Override
+            public void markState(NodeId id, NodeState newState) {
+                throw new UnsupportedOperationException();
+            }
+
+            @Override
+            public java.util.List<NodeInfo> listAlive() {
+                throw new UnsupportedOperationException();
+            }
+
+            @Override
+            public java.util.List<NodeInfo> listAll() {
+                throw new UnsupportedOperationException();
+            }
+
+            @Override
+            public void tombstone(NodeId id) {
+                throw new UnsupportedOperationException();
+            }
+        };
+        var store = new InMemoryCapabilityStateStore(SystemClock.instance());
+        CapabilityManager m = new CapabilityManager(SELF, store, SystemClock.instance());
+        m.register(new MockCapability(SELF, (cap, partition) -> Optional.empty(), key -> 0));
+        LocalNodeCommandChannel local = new LocalNodeCommandChannel(SELF, m);
+        try (GrpcNodeCommandChannel ch = new GrpcNodeCommandChannel(SELF, local, failing)) {
+            assertThat(ch.startCapability(REMOTE, CapabilityType.MOCK)).isFalse();
+            assertThat(ch.stopCapability(REMOTE, CapabilityType.MOCK)).isFalse();
+            assertThat(ch.freeze(REMOTE, CapabilityType.MOCK, true)).isFalse();
+        }
+    }
+
     /** 记录命令并恒定返回 ok 的假 ClusterControl 服务。 */
     private static final class FakeClusterControl extends ClusterControlGrpc.ClusterControlImplBase {
 

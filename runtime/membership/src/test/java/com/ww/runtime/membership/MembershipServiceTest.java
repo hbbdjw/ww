@@ -193,6 +193,108 @@ class MembershipServiceTest {
         assertThat(b.eventTypesFor("A")).contains(MemberEvent.NODE_ACTIVE);
     }
 
+    @Test
+    void stopWaitsForInFlightHeartbeatTick() throws Exception {
+        // A4：首次 peers() 阻塞在 gate 监视器上（monitor 等待不受 shutdownNow 中断影响），
+        // 确定性地把一次心跳 tick 停在 directory.peers() 内
+        Object gate = new Object();
+        CountDownLatch entered = new CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicBoolean first = new java.util.concurrent.atomic.AtomicBoolean(true);
+        PeerDirectory blockingDir = () -> {
+            if (first.compareAndSet(true, false)) {
+                entered.countDown();
+                synchronized (gate) {
+                    // 等待主线程释放 gate
+                }
+            }
+            return List.of();
+        };
+
+        TestNode node = new TestNode("solo", blockingDir);
+        services.add(node.service);
+        hosts.add(node.host);
+
+        java.util.concurrent.CompletableFuture<Void> stopFuture =
+                new java.util.concurrent.CompletableFuture<>();
+        synchronized (gate) {
+            node.service.start();
+            node.host.start(0);
+            assertThat(entered.await(5, TimeUnit.SECONDS)).as("tick 进入 peers()").isTrue();
+            // tick 被 gate 羁留：stop() 的 awaitTermination 必须等它，持锁期间不可能返回
+            Thread stopper = new Thread(() -> {
+                try {
+                    node.service.stop();
+                    stopFuture.complete(null);
+                } catch (Throwable t) {
+                    stopFuture.completeExceptionally(t);
+                }
+            });
+            stopper.start();
+            try {
+                stopFuture.get(200, TimeUnit.MILLISECONDS);
+                fail("stop() 应等待在途心跳 tick 终结");
+            } catch (java.util.concurrent.TimeoutException expected) {
+                // stop 尚未返回——正在等待在途 tick（预期）
+            }
+        }
+        // gate 释放：tick 终结，stop 随后完成
+        stopFuture.get(5, TimeUnit.SECONDS);
+    }
+
+    @Test
+    void stopClearsChannelsAndIsIdempotent() throws Exception {
+        // S21：先显式等待出站通道建立（视图 ACTIVE 可由入站心跳单方面确立，
+        // 不保证本节点已建出站通道），再停机断言清空且不重建
+        TestNode[] pair = createPair();
+        startAll(pair);
+        awaitChannelsNonEmpty(pair[0].service);
+        assertThat(failureCountsOf(pair[0].service)).isNotNull();
+
+        pair[0].service.stop();
+        assertThat(channelsOf(pair[0].service)).isEmpty();
+        assertThat(failureCountsOf(pair[0].service)).isEmpty();
+
+        // 停机后执行器已终结：等待若干心跳周期，通道不得被重建
+        Thread.sleep(INTERVAL_MS * 3);
+        assertThat(channelsOf(pair[0].service)).isEmpty();
+
+        pair[0].service.stop(); // 幂等
+        assertThat(channelsOf(pair[0].service)).isEmpty();
+    }
+
+    /** 轮询等待出站通道建立（心跳每 {@value #INTERVAL_MS}ms 一轮，必然在有限轮内建通道）。 */
+    private void awaitChannelsNonEmpty(MembershipService service) {
+        long deadline = System.currentTimeMillis() + 10_000;
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                if (!channelsOf(service).isEmpty()) {
+                    return;
+                }
+            } catch (Exception e) {
+                throw new IllegalStateException("failed to read channels", e);
+            }
+            try {
+                Thread.sleep(20);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("interrupted while waiting for channels", e);
+            }
+        }
+        fail("timeout waiting for outbound channel to be established");
+    }
+
+    private static Map<?, ?> channelsOf(MembershipService service) throws Exception {
+        java.lang.reflect.Field f = MembershipService.class.getDeclaredField("channels");
+        f.setAccessible(true);
+        return (Map<?, ?>) f.get(service);
+    }
+
+    private static Map<?, ?> failureCountsOf(MembershipService service) throws Exception {
+        java.lang.reflect.Field f = MembershipService.class.getDeclaredField("consecutiveSendFailures");
+        f.setAccessible(true);
+        return (Map<?, ?>) f.get(service);
+    }
+
     // ------------------------------------------------------------------
     // 集成：疑似 → 死亡（时序）
     // ------------------------------------------------------------------
@@ -256,16 +358,19 @@ class MembershipServiceTest {
 
         awaitTrue(() -> a.stateOf("B") == NodeState.ACTIVE, 15_000, "B recovers to ACTIVE in A's view");
 
-        // NODE_ACTIVE 事件出现在 NODE_DEAD 之后（恢复事件）
+        // NODE_ACTIVE 事件出现在 NODE_DEAD 之后（恢复事件：视图经节点自报更新）
         List<String> types = a.eventTypesFor("B");
         assertThat(types.lastIndexOf(MemberEvent.NODE_ACTIVE))
                 .as("recovery NODE_ACTIVE after NODE_DEAD: %s", types)
                 .isGreaterThan(types.indexOf(MemberEvent.NODE_DEAD));
 
-        // 状态回写包含 ACTIVE 恢复
+        // 状态回写不包含 DEAD→ACTIVE 复活：DEAD 为终态，复活须由节点重新注册
+        // （DEAD→JOINING→ACTIVE），membership 只负责检测死亡，不负责复活回写
         List<NodeState> sink = a.sinkCalls.getOrDefault(NodeId.of("B"), List.of());
         assertThat(sink.indexOf(NodeState.DEAD)).isGreaterThanOrEqualTo(0);
-        assertThat(sink.lastIndexOf(NodeState.ACTIVE)).isGreaterThan(sink.indexOf(NodeState.DEAD));
+        assertThat(sink.lastIndexOf(NodeState.ACTIVE))
+                .as("membership must not write back DEAD -> ACTIVE revival: %s", sink)
+                .isLessThan(sink.indexOf(NodeState.DEAD));
     }
 
     // ------------------------------------------------------------------

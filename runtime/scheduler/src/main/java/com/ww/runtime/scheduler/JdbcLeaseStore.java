@@ -22,14 +22,15 @@ import java.util.Optional;
  *   UPDATE rt_scheduler_lease SET owner = ?, expires_at_ms = ?
  *    WHERE id = 1 AND (owner = ? OR expires_at_ms &lt; ?)
  * </pre>
- * <p>行不存在时先 {@code INSERT ... ON CONFLICT (id) DO NOTHING} 兜底（并发初始化
- * 只有一个节点插入成功），再执行上述 UPDATE。全部语义在单条 SQL 内原子完成，
- * 多实例并发竞争安全。</p>
+ * <p>常规续约路径单次 UPDATE 往返（S20）；行不存在时先 {@code INSERT ...
+ * ON CONFLICT (id) DO NOTHING} 兜底（并发初始化只有一个节点插入成功），
+ * 插入冲突（行存在但条件未命中）再 UPDATE 一次覆盖两语句间隙恰好过期。
+ * 全部语义原子完成，多实例并发竞争安全。</p>
  *
  * <p>过期语义：{@code expires_at_ms < now}（与 {@link InMemoryLeaseStore} 一致）。
  * SQL 异常包装为 {@link RuntimeFrameworkException}。</p>
  *
- * <p>本实现仅保证编译与语义正确性，行为由 PostgreSQL 集成测试覆盖。</p>
+ * <p>针对真实 PostgreSQL 的行为（条件 UPDATE 并发抢占等）由集成测试覆盖。</p>
  */
 public final class JdbcLeaseStore implements LeaseStore {
 
@@ -67,21 +68,36 @@ public final class JdbcLeaseStore implements LeaseStore {
         long now = clock.nowMillis();
         long expiresAt = now + ttlMillis;
         try (Connection connection = dataSource.getConnection()) {
+            // S20：先 UPDATE（常规续约单次往返）→ 未命中说明行不存在则 INSERT 兜底
+            // → 插入冲突（行存在但条件未命中）再 UPDATE 一次（覆盖两语句间隙恰好过期）
+            try (PreparedStatement update = connection.prepareStatement(ACQUIRE_OR_RENEW)) {
+                bindAcquire(update, owner, expiresAt, now);
+                if (update.executeUpdate() == 1) {
+                    return true;
+                }
+            }
             try (PreparedStatement insert = connection.prepareStatement(INSERT_ROW)) {
                 insert.setString(1, owner);
                 insert.setLong(2, expiresAt);
-                insert.executeUpdate();
+                if (insert.executeUpdate() == 1) {
+                    return true; // 行首次创建成功（并发初始化只有一个节点成功）
+                }
             }
             try (PreparedStatement update = connection.prepareStatement(ACQUIRE_OR_RENEW)) {
-                update.setString(1, owner);
-                update.setLong(2, expiresAt);
-                update.setString(3, owner);
-                update.setLong(4, now);
+                bindAcquire(update, owner, expiresAt, now);
                 return update.executeUpdate() == 1;
             }
         } catch (SQLException e) {
             throw new RuntimeFrameworkException("failed to acquire/renew scheduler lease for " + owner, e);
         }
+    }
+
+    private static void bindAcquire(PreparedStatement statement, String owner, long expiresAt, long now)
+            throws SQLException {
+        statement.setString(1, owner);
+        statement.setLong(2, expiresAt);
+        statement.setString(3, owner);
+        statement.setLong(4, now);
     }
 
     @Override

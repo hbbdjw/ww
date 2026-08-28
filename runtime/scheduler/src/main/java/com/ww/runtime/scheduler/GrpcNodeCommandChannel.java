@@ -128,7 +128,14 @@ public final class GrpcNodeCommandChannel implements NodeCommandChannel, AutoClo
     }
 
     private ClusterControlGrpc.ClusterControlBlockingStub stubFor(NodeId node) {
-        NodeInfo info = registry.get(node).orElse(null);
+        NodeInfo info;
+        try {
+            info = registry.get(node).orElse(null);
+        } catch (RuntimeException e) {
+            // S18：注册表查询失败（如 DB 故障）不得穿透——命令通道契约是失败返回 false
+            LOG.warn("registry lookup failed for node {}: {}", node, e.toString());
+            return null;
+        }
         if (info == null) {
             LOG.debug("node {} unknown to registry, cannot dispatch command", node);
             return null;
@@ -154,6 +161,10 @@ public final class GrpcNodeCommandChannel implements NodeCommandChannel, AutoClo
             return ack.getOk();
         } catch (StatusRuntimeException e) {
             LOG.warn("grpc command failed: {} ({})", e.getStatus().getCode(), e.getMessage());
+            return false;
+        } catch (Exception e) {
+            // S18：其余异常（序列化/截止处理等）同样兜底——命令失败不得穿透，下周期重试
+            LOG.warn("command dispatch failed unexpectedly: {}", e.toString());
             return false;
         }
     }

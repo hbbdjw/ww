@@ -150,11 +150,18 @@ public final class MembershipService extends MembershipGrpc.MembershipImplBase {
         heartbeatExecutor = null;
         if (hb != null) {
             hb.shutdownNow();
+            try {
+                // A4：等待在途心跳 tick 终结，避免其在通道清理后重建 channel 造成泄漏
+                hb.awaitTermination(2, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
         }
         for (PeerChannel pc : channels.values()) {
             pc.close();
         }
         channels.clear();
+        consecutiveSendFailures.clear();
         List<StreamObserver<MembershipEvent>> toComplete = new ArrayList<>(watchers);
         watchers.clear();
         ExecutorService dispatcher = eventDispatcher;
@@ -286,6 +293,9 @@ public final class MembershipService extends MembershipGrpc.MembershipImplBase {
 
     private void sendHeartbeat(NodeInfo peer) {
         PeerChannel pc = channelFor(peer);
+        if (pc == null) {
+            return; // 已停机（S21 守卫），不再发送
+        }
         NodeId peerId = peer.id();
         MembershipGrpc.MembershipStub stub = MembershipGrpc.newStub(pc.channel);
         StreamObserver<HeartbeatReq> requestStream = stub.heartbeat(new StreamObserver<>() {
@@ -328,7 +338,15 @@ public final class MembershipService extends MembershipGrpc.MembershipImplBase {
         requestStream.onCompleted();
     }
 
+    /**
+     * 取/建对端通道。{@code started} 守卫：停机后返回 null 不再建通道（S21）——
+     * 配合 {@link #stop()} 先 {@code awaitTermination} 等待在途 tick 终结、再清理通道的
+     * 顺序，杜绝 stop 后心跳重建通道导致的泄漏。
+     */
     private PeerChannel channelFor(NodeInfo peer) {
+        if (!started) {
+            return null; // 已停机：不再建通道
+        }
         PeerChannel existing = channels.get(peer.id());
         if (existing != null && existing.host.equals(peer.host()) && existing.port == peer.grpcPort()) {
             return existing;
@@ -363,9 +381,12 @@ public final class MembershipService extends MembershipGrpc.MembershipImplBase {
                 if (info.state() != NodeState.SUSPECTED && info.state() != NodeState.DEAD) {
                     transitionLocal(id, NodeState.SUSPECTED);
                 }
-            } else if (info.state() == NodeState.SUSPECTED || info.state() == NodeState.DEAD) {
+            } else if (info.state() == NodeState.SUSPECTED) {
                 transitionLocal(id, NodeState.ACTIVE);
             }
+            // DEAD 不在本地检测路径复活：DEAD 为终态，复活必须经重新注册
+            // （DEAD→JOINING→ACTIVE）。「重新收到消息」可能是残留重传/旧流回放，
+            // 直接 DEAD→ACTIVE 既是非法跃迁，也会跳过注册流程的元数据重置。
         }
     }
 
@@ -396,8 +417,12 @@ public final class MembershipService extends MembershipGrpc.MembershipImplBase {
                 event = new MemberEvent(
                         local.state() == incoming.state() ? MemberEvent.NODE_UPDATED : eventType(incoming.state()),
                         incoming);
-                // 恢复：先前被判 SUSPECTED/DEAD 的节点重新报来 ACTIVE → 回写宿主
-                recoveredToActive = incoming.state() == NodeState.ACTIVE && local.state() != NodeState.ACTIVE;
+                // 恢复：先前被判 SUSPECTED 的节点重新报来 ACTIVE → 回写宿主。
+                // 排除 DEAD：DEAD 为终态，复活节点须重新注册（DEAD→JOINING→ACTIVE），
+                // gossip 直接复活会触发非法跃迁且跳过注册流程的元数据重置
+                recoveredToActive = incoming.state() == NodeState.ACTIVE
+                        && local.state() != NodeState.ACTIVE
+                        && local.state() != NodeState.DEAD;
             }
         }
         if (recoveredToActive) {
