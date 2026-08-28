@@ -190,6 +190,40 @@ class AofServiceTest {
     }
 
     @Test
+    @DisplayName("C2：事务内混合类型参数重启回放后类型与值逐一相等")
+    void transactionMixedTypesRoundTrip() throws Exception {
+        AofService[] holder = new AofService[1];
+        SimpleCache<String, Object> cache = startWriting(holder);
+        cache.multi();
+        cache.put("t1", 42);
+        cache.put("t2", 99L);
+        cache.put("t3", 3.14d);
+        cache.put("t4", true);
+        cache.put("t5", "ttl-val", 60_000);
+        cache.hset("th", "f1", 7L);
+        cache.zadd("tz", 2.5d, "m");
+        cache.rpush("tl", "a", "b");
+        cache.exec();
+        stopAof(holder[0]);
+
+        SimpleCache<String, Object> restored = replayFromDisk(holder);
+        assertThat(restored.get("t1")).isEqualTo(42);
+        assertThat(restored.get("t2")).isEqualTo(99L);
+        assertThat(restored.get("t3")).isEqualTo(3.14d);
+        assertThat(restored.get("t4")).isEqualTo(true);
+        assertThat(restored.get("t5")).as("PUT_EXPIRED 的 TTL 回放后不得归零").isEqualTo("ttl-val");
+        assertThat(restored.hgetAll("th")).containsEntry("f1", 7L);
+        List<Map.Entry<String, ConcurrentSkipListMap<Double, Set<Object>>>> zentries =
+                restored.getAllZSetEntries();
+        assertThat(zentries).hasSize(1);
+        assertThat(zentries.get(0).getValue().get(2.5d)).containsExactly("m");
+        List<Map.Entry<String, ConcurrentLinkedDeque<Object>>> lentries = restored.getAllListEntries();
+        assertThat(lentries).hasSize(1);
+        assertThat(lentries.get(0).getValue().toArray()).containsExactly("a", "b");
+        stopAof(holder[0]);
+    }
+
+    @Test
     @DisplayName("C1：ZSet 经重写后回放完整恢复，不再被误当 Hash 写出毒记录")
     void zsetRewriteRoundTrip() throws Exception {
         AofService[] holder = new AofService[1];

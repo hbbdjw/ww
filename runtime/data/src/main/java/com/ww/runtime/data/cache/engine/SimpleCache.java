@@ -186,13 +186,13 @@ public class SimpleCache<K, V> implements Cache<K, V> {
         final Object key;
         final String aofOp;
         final String aofKey;
-        final String aofArgs;
+        final Object[] aofArgs;
 
         QueuedCommand(java.util.function.Supplier<Object> action) {
             this(action, null, null, null, null);
         }
 
-        QueuedCommand(java.util.function.Supplier<Object> action, Object key, String aofOp, String aofKey, String aofArgs) {
+        QueuedCommand(java.util.function.Supplier<Object> action, Object key, String aofOp, String aofKey, Object[] aofArgs) {
             this.action = action;
             this.key = key;
             this.aofOp = aofOp;
@@ -223,25 +223,12 @@ public class SimpleCache<K, V> implements Cache<K, V> {
         }
     }
 
-    private static String joinArgs(Object... args) {
-        if (args == null || args.length == 0) {
-            return "";
-        }
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < args.length; i++) {
-            if (i > 0) sb.append('\t');
-            sb.append(args[i] != null ? args[i].toString() : "");
-        }
-        return sb.toString();
-    }
-
     // ==================== 事务辅助 ====================
 
     private void queueOrExec(K key, String aofOp, Object[] aofArgs, java.util.function.Supplier<Object> action) {
         TxContext<K> tx = txHolder.get();
         if (tx != null && tx.active) {
-            String argsStr = joinArgs(aofArgs);
-            tx.commands.add(new QueuedCommand(action, key, aofOp, key != null ? key.toString() : "", argsStr));
+            tx.commands.add(new QueuedCommand(action, key, aofOp, key != null ? key.toString() : "", aofArgs));
         } else {
             action.get();
             bumpVersion(key);
@@ -252,8 +239,7 @@ public class SimpleCache<K, V> implements Cache<K, V> {
     private Object queueOrExecReturn(K key, String aofOp, Object[] aofArgs, java.util.function.Supplier<Object> action) {
         TxContext<K> tx = txHolder.get();
         if (tx != null && tx.active) {
-            String argsStr = joinArgs(aofArgs);
-            tx.commands.add(new QueuedCommand(action, key, aofOp, key != null ? key.toString() : "", argsStr));
+            tx.commands.add(new QueuedCommand(action, key, aofOp, key != null ? key.toString() : "", aofArgs));
             return null;
         }
         Object result = action.get();
@@ -394,13 +380,13 @@ public class SimpleCache<K, V> implements Cache<K, V> {
                 lruClear();
                 streamStore.clear();
                 return null;
-            }, null, "CLEAR", "", ""));
+            }, null, "CLEAR", "", new Object[0]));
             return;        }
         store.clear();
         versions.clear();
         lruClear();
         streamStore.clear();
-        logAof("CLEAR", null, "");
+        logAof("CLEAR", null);
     }
 
     @Override
@@ -844,9 +830,9 @@ public class SimpleCache<K, V> implements Cache<K, V> {
                 if (cmd.key != null) {
                     bumpVersion((K) cmd.key);
                 }
-                // 事务内的写操作记录 AOF
+                // 事务内的写操作记录 AOF（类型化参数，与非事务路径字节级同构）
                 if (cmd.aofOp != null && aofService != null) {
-                    aofService.log(cmd.aofOp, cmd.aofKey, cmd.aofArgs);
+                    aofService.logTyped(cmd.aofOp, cmd.aofKey, cmd.aofArgs);
                 }
             }
             return results;

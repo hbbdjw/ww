@@ -191,6 +191,11 @@ public class AofService {
         }
     }
 
+    /**
+     * @deprecated 文本拼接通道会把多参数压扁为单串导致回放损坏，
+     * 唯一调用方（SimpleCache.exec）已切换 {@link #logTyped}，计划阶段 3 删除。
+     */
+    @Deprecated
     public void log(String operation, String cacheKey, String args) {
         if ("CLEAR".equals(operation)) {
             logTyped(operation, "", new Object[0]);
