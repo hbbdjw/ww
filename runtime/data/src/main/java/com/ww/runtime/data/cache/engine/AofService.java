@@ -49,6 +49,8 @@ public class AofService {
     private File aofDir;
     private OutputStream aofOut;
     private DataOutputStream aofDataOut;
+    /** 穿透装饰器的原始流引用：fsync（getFD().sync()）与损坏截断（channel().truncate）需要它 */
+    private FileOutputStream aofRawOut;
     private final Object writeLock = new Object();
     private long aofFileSize = 0;
     private long lastRewriteSize = 0;
@@ -91,7 +93,8 @@ public class AofService {
         aofFile = new File(aofDir, properties.getFilename());
 
         boolean isNewFile = !aofFile.exists() || aofFile.length() == 0;
-        aofOut = new BufferedOutputStream(new FileOutputStream(aofFile, true), properties.getBufferSize());
+        aofRawOut = new FileOutputStream(aofFile, true);
+        aofOut = new BufferedOutputStream(aofRawOut, properties.getBufferSize());
         aofDataOut = new DataOutputStream(aofOut);
 
         if (isNewFile) {
@@ -158,6 +161,7 @@ public class AofService {
             if (aofOut != null) {
                 aofOut.close();
                 aofOut = null;
+                aofRawOut = null;
             }
         } catch (IOException e) {
             log.error("AOF关闭异常", e);
@@ -245,9 +249,8 @@ public class AofService {
 
     private void flushToDisk(boolean forceFsync) throws IOException {
         aofDataOut.flush();
-        if (forceFsync && aofOut instanceof FileOutputStream) {
-            FileOutputStream fos = (FileOutputStream) aofOut;
-            fos.getFD().sync();
+        if (forceFsync && aofRawOut != null) {
+            aofRawOut.getFD().sync();
         }
     }
 
@@ -667,12 +670,13 @@ public class AofService {
                     // move 失败：旧文件未被替换仍然完好，重开续写，避免旧流已关闭导致
                     // 后续写入静默落空（缓冲写入不抛异常、flush 异常被上层吞掉）
                     log.error("AOF重写换文件失败，重开旧文件续写", moveFail);
-                    aofOut = new BufferedOutputStream(new FileOutputStream(aofFile, true),
-                            properties.getBufferSize());
+                    aofRawOut = new FileOutputStream(aofFile, true);
+                    aofOut = new BufferedOutputStream(aofRawOut, properties.getBufferSize());
                     aofDataOut = new DataOutputStream(aofOut);
                     throw moveFail;
                 }
-                aofOut = new BufferedOutputStream(new FileOutputStream(aofFile, true), properties.getBufferSize());
+                aofRawOut = new FileOutputStream(aofFile, true);
+                aofOut = new BufferedOutputStream(aofRawOut, properties.getBufferSize());
                 aofDataOut = new DataOutputStream(aofOut);
                 aofFileSize = aofFile.length();
                 lastRewriteSize = aofFileSize;

@@ -190,6 +190,33 @@ class AofServiceTest {
     }
 
     @Test
+    @DisplayName("C4：always 策略每写即落盘，重启回放等价")
+    void alwaysFsyncRoundTrip() throws Exception {
+        AofProperties p = props();
+        p.setAppendfsync("always");
+
+        SimpleCache<String, Object> cache = new SimpleCache<>();
+        AofService aof = new AofService(p, cache);
+        aof.start();
+        cache.setAofService(aof);
+        cache.put("a1", "v1");
+        cache.put("a2", 42);
+
+        // 不经 stop 直接读盘：always 策略每写 flush+sync，记录应已在磁盘文件中
+        byte[] raw = java.nio.file.Files.readAllBytes(new File(dir, "appendonly.aof").toPath());
+        assertThat(raw.length).as("always 策略写入后字节应已落盘").isGreaterThan(4);
+        aof.stop();
+
+        SimpleCache<String, Object> restored = new SimpleCache<>();
+        AofService aof2 = new AofService(p, restored);
+        aof2.start();
+        aof2.replay(restored);
+        assertThat(restored.get("a1")).isEqualTo("v1");
+        assertThat(restored.get("a2")).isEqualTo(42);
+        aof2.stop();
+    }
+
+    @Test
     @DisplayName("C2：事务内混合类型参数重启回放后类型与值逐一相等")
     void transactionMixedTypesRoundTrip() throws Exception {
         AofService[] holder = new AofService[1];
