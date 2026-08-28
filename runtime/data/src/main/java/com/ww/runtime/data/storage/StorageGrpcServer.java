@@ -73,6 +73,16 @@ public final class StorageGrpcServer extends StorageGrpc.StorageImplBase {
         this.chunkSize = chunkSize;
     }
 
+    /** T2 容错指标：落盘工作线程退出后被丢弃的冗余分片累计数。 */
+    public long chunksDiscardedAfterAbort() {
+        return chunksDiscardedAfterAbort.get();
+    }
+
+    /** T2 容错指标：因入队超时判死的流累计数。 */
+    public long streamsAbortedOnPushTimeout() {
+        return streamsAbortedOnPushTimeout.get();
+    }
+
     // ------------------------------------------------------------------
     // 网关转发（属主节点执行 S3 语义）
     // ------------------------------------------------------------------

@@ -48,6 +48,7 @@ class StorageGrpcServerTest {
     private StorageProperties props;
     private StorageCapability capability;
     private GrpcServerHost host;
+    private StorageGrpcServer server;
     private StorageGrpcClient client;
 
     @BeforeEach
@@ -62,7 +63,8 @@ class StorageGrpcServerTest {
         view.owner = Optional.of(new PlacementView.Owner(SELF, 3L));
 
         host = new GrpcServerHost();
-        host.addService(new StorageGrpcServer(capability, 8));
+        server = new StorageGrpcServer(capability, 8);
+        host.addService(server);
         host.start(0);
 
         client = new StorageGrpcClient(new StoragePeerDirectory() {
@@ -240,6 +242,10 @@ class StorageGrpcServerTest {
         // 版本不回退，且后续无关 RPC 正常（节点未被钉死的回调线程拖垮）
         assertThat(capability.head("b1", "k1").getVersion()).isEqualTo(2L);
         assertThat(client.forwardHead(SELF, "b1", "k1")).isPresent();
+
+        // T2 指标访问器可用（具体计数取决于传输层是否在应答后仍投递分片，不做定量断言）
+        assertThat(server.chunksDiscardedAfterAbort()).isGreaterThanOrEqualTo(0L);
+        assertThat(server.streamsAbortedOnPushTimeout()).isGreaterThanOrEqualTo(0L);
     }
 
     @Test
