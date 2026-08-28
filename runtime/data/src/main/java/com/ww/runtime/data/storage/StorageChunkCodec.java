@@ -1,13 +1,15 @@
 package com.ww.runtime.data.storage;
 
 import com.ww.runtime.migration.ChunkCodec;
-import com.ww.storage.ObjectMetadata;
+import com.ww.runtime.data.storage.engine.ObjectMetadata;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 import tools.jackson.databind.node.ObjectNode;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 /**
  * STORAGE 能力迁移分片编解码。
@@ -47,6 +49,14 @@ public final class StorageChunkCodec {
         header.put("createdAt", meta.getCreatedAt());
         header.put("offset", offset);
         header.put("fin", fin);
+        // T8：随片携带用户自定义元数据（非空才写，旧格式片无此字段，解码侧容忍缺失）
+        Map<String, String> userMeta = meta.getUserMetadata();
+        if (userMeta != null && !userMeta.isEmpty()) {
+            ObjectNode umNode = header.putObject("userMetadata");
+            for (Map.Entry<String, String> e : userMeta.entrySet()) {
+                umNode.put(e.getKey(), e.getValue());
+            }
+        }
         String line = header.toString()
                 + Character.toString(ChunkCodec.SEP_KV)
                 + Base64.getEncoder().encodeToString(data)
@@ -81,6 +91,15 @@ public final class StorageChunkCodec {
                     new String(chunk, sep + 1, bodyEnd - sep - 1, StandardCharsets.UTF_8));
             ObjectMetadata meta = new ObjectMetadata(key, size, contentType,
                     etag == null || etag.isEmpty() ? null : etag, createdAt, version);
+            // T8：重建用户自定义元数据；旧格式分片无此字段 → 容忍缺失（保持空）
+            JsonNode umNode = h.get("userMetadata");
+            if (umNode != null && umNode.isObject()) {
+                Map<String, String> um = new LinkedHashMap<>();
+                for (Map.Entry<String, JsonNode> e : umNode.properties()) {
+                    um.put(e.getKey(), e.getValue().asString());
+                }
+                meta.setUserMetadata(um);
+            }
             return new StorageChunkView(bucket, meta, data, offset, fin);
         } catch (RuntimeException e) {
             return null;

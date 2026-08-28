@@ -203,6 +203,23 @@ class StorageGrpcServerTest {
     }
 
     @Test
+    void replicatePreservesUserMetadata() throws Exception {
+        // 本节点为副本，接收主节点复制
+        view.owner = Optional.of(new PlacementView.Owner(NodeId.of("primary-node"), 3L));
+        byte[] payload = "meta-preserved".getBytes(StandardCharsets.UTF_8);
+        ObjectMetadata primaryMeta = new ObjectMetadata("k2", payload.length, "text/plain", "etag-m", 42L, 5L);
+        primaryMeta.setUserMetadata(Map.of("x-amz-meta-owner", "ww", "x-amz-meta-env", "prod"));
+
+        assertThat(clientReplicate(primaryMeta, payload)).isTrue();
+
+        ObjectMetadata local = capability.head("b1", "k2");
+        assertThat(local).isNotNull();
+        assertThat(local.getUserMetadata())
+                .containsEntry("x-amz-meta-owner", "ww")
+                .containsEntry("x-amz-meta-env", "prod");
+    }
+
+    @Test
     @Timeout(10)
     void replicateIdempotentSkipDoesNotPinCallbackThread() throws Exception {
         // 本节点为副本（属主在别处），接收复制

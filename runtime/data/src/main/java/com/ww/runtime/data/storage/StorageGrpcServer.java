@@ -343,9 +343,14 @@ public final class StorageGrpcServer extends StorageGrpc.StorageImplBase {
 
         private ObjectMetadata headerMeta(ObjectChunkP chunk) {
             // 副本路径直接以主节点元数据落盘（version/etag/createdAt 由主预计算）
-            return new ObjectMetadata(chunk.getKey(), chunk.getSize(), chunk.getContentType(),
+            ObjectMetadata meta = new ObjectMetadata(chunk.getKey(), chunk.getSize(), chunk.getContentType(),
                     chunk.getEtag().isEmpty() ? null : chunk.getEtag(),
                     chunk.getCreatedAt(), chunk.getVersion());
+            // T7：补齐用户自定义元数据（发送端经 userMetaMap 携带，此前被丢弃）
+            if (!chunk.getUserMetaMap().isEmpty()) {
+                meta.setUserMetadata(chunk.getUserMetaMap());
+            }
+            return meta;
         }
     }
 
