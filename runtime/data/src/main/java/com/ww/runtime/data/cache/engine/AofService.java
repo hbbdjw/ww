@@ -65,6 +65,12 @@ public class AofService {
     private long lastFlushFailTime = 0;
     private int consecutiveFailures = 0;
     private long commandCount = 0;
+    /** 回放时跳过的毒记录条数（CRC 完好但应用失败，如存量 ZSet 误写的 OP_HSET） */
+    private final java.util.concurrent.atomic.AtomicLong poisonRecordsSkipped =
+            new java.util.concurrent.atomic.AtomicLong();
+    /** 回放 CRC 校验失败次数（结构性损坏） */
+    private final java.util.concurrent.atomic.AtomicLong crcFailures =
+            new java.util.concurrent.atomic.AtomicLong();
 
     public AofService(AofProperties properties, SimpleCache<String, Object> cache) {
         this.properties = properties;
@@ -315,8 +321,17 @@ public class AofService {
                         continue;
                     }
 
-                    replayCommand(cache, opCode, key, args);
-                    applied++;
+                    try {
+                        replayCommand(cache, opCode, key, args);
+                        applied++;
+                    } catch (RuntimeException poison) {
+                        // CRC 完好的单条毒记录（如存量 ZSet 被误写为 OP_HSET）：
+                        // 跳过 + 告警 + 计数，后续记录边界仍可信，不中断回放；
+                        // 结构性损坏（解析失败）归 IOException 分支处理
+                        poisonRecordsSkipped.incrementAndGet();
+                        log.error("AOF毒记录跳过：op={}, key={}, err={}",
+                                AofFormat.opName(opCode), key, poison.toString());
+                    }
                 } catch (IOException e) {
                     corrupted++;
                     log.error("AOF回放损坏，在位置 {} 停止", applied + filtered, e);
@@ -327,7 +342,8 @@ public class AofService {
             log.error("AOF文件读取失败", e);
         }
 
-        log.info("AOF回放完成：应用 {} 条，跳过 {} 条非owner，损坏 {} 条", applied, filtered, corrupted);
+        log.info("AOF回放完成：应用 {} 条，跳过 {} 条非owner，损坏 {} 条，毒记录跳过 {} 条",
+                applied, filtered, corrupted, poisonRecordsSkipped.get());
     }
 
     private void replayCommand(Cache<String, Object> cache, byte opCode, String key, Object[] args) {
@@ -822,7 +838,7 @@ public class AofService {
         synchronized (writeLock) {
             return new AofStatus(lastFlushFailTime, consecutiveFailures,
                     rewriting ? rewriteBuffer.size() : 0, aofFileSize,
-                    rewriting, commandCount);
+                    rewriting, commandCount, poisonRecordsSkipped.get(), crcFailures.get());
         }
     }
 
@@ -833,15 +849,20 @@ public class AofService {
         private final long fileSizeBytes;
         private final boolean rewriting;
         private final long totalCommands;
+        private final long poisonRecordsSkipped;
+        private final long crcFailures;
 
         public AofStatus(long lastFlushFailTime, int consecutiveFailures, int bufferSize,
-                         long fileSizeBytes, boolean rewriting, long totalCommands) {
+                         long fileSizeBytes, boolean rewriting, long totalCommands,
+                         long poisonRecordsSkipped, long crcFailures) {
             this.lastFlushFailTime = lastFlushFailTime;
             this.consecutiveFailures = consecutiveFailures;
             this.bufferSize = bufferSize;
             this.fileSizeBytes = fileSizeBytes;
             this.rewriting = rewriting;
             this.totalCommands = totalCommands;
+            this.poisonRecordsSkipped = poisonRecordsSkipped;
+            this.crcFailures = crcFailures;
         }
 
         public long getLastFlushFailTime() { return lastFlushFailTime; }
@@ -850,5 +871,9 @@ public class AofService {
         public long getFileSizeBytes() { return fileSizeBytes; }
         public boolean isRewriting() { return rewriting; }
         public long getTotalCommands() { return totalCommands; }
+        /** 回放跳过的毒记录条数（CRC 完好但应用失败） */
+        public long getPoisonRecordsSkipped() { return poisonRecordsSkipped; }
+        /** 回放 CRC 校验失败次数（结构性损坏） */
+        public long getCrcFailures() { return crcFailures; }
     }
 }

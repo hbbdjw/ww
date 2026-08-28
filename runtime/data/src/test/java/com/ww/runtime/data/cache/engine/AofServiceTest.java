@@ -190,6 +190,56 @@ class AofServiceTest {
     }
 
     @Test
+    @DisplayName("C1：ZSet 经重写后回放完整恢复，不再被误当 Hash 写出毒记录")
+    void zsetRewriteRoundTrip() throws Exception {
+        AofService[] holder = new AofService[1];
+        SimpleCache<String, Object> cache = startWriting(holder);
+        cache.zadd("z", 1.5d, "a");
+        cache.zadd("z", 2.5d, "b");
+
+        holder[0].bgRewriteAof();
+        awaitRewriteFinish(holder[0]);
+        stopAof(holder[0]);
+
+        SimpleCache<String, Object> restored = replayFromDisk(holder);
+        List<Map.Entry<String, ConcurrentSkipListMap<Double, Set<Object>>>> entries =
+                restored.getAllZSetEntries();
+        assertThat(entries).hasSize(1);
+        assertThat(entries.get(0).getValue()).containsKeys(1.5d, 2.5d);
+        assertThat(entries.get(0).getValue().get(1.5d)).containsExactly("a");
+        assertThat(entries.get(0).getValue().get(2.5d)).containsExactly("b");
+        // 修复前：getAllHashEntries 会把 ZSet 当 Hash 重写为 OP_HSET（field 为 Double），
+        // 回放触发 ClassCastException 中断；修复后无毒记录
+        assertThat(holder[0].getStatus().getPoisonRecordsSkipped()).isZero();
+        stopAof(holder[0]);
+    }
+
+    @Test
+    @DisplayName("C1：存量毒记录跳过+计数，后续完好记录正常应用")
+    void poisonRecordSkippedAndCounted() throws Exception {
+        // 手工构造存量带毒文件：毒记录模拟旧版把 ZSet score 桶误写为 OP_HSET
+        // （field 为 Double → 回放 hset 的 (String) 强转抛 ClassCastException）
+        File aofFile = new File(dir, "appendonly.aof");
+        try (java.io.DataOutputStream out = new java.io.DataOutputStream(
+                new java.io.FileOutputStream(aofFile))) {
+            out.writeInt(AofFormat.AOF_MAGIC);
+            out.write(AofFormat.encodeCommand(AofFormat.OP_HSET, "zkey", 1.5d, Set.of("a")));
+            out.write(AofFormat.encodeCommand(AofFormat.OP_PUT, "ok", "v"));
+        }
+
+        AofProperties p = props();
+        SimpleCache<String, Object> restored = new SimpleCache<>();
+        AofService aof = new AofService(p, restored);
+        aof.start();
+        aof.replay(restored);
+
+        assertThat(restored.get("ok")).as("毒记录之后的完好记录仍应应用").isEqualTo("v");
+        assertThat(restored.get("zkey")).isNull();
+        assertThat(aof.getStatus().getPoisonRecordsSkipped()).isEqualTo(1);
+        aof.stop();
+    }
+
+    @Test
     @DisplayName("重写后增量写入：快照 + 增量记录共同保证回放一致（普通类型）")
     void rewriteThenIncrementalRoundTrip() throws Exception {
         AofService[] holder = new AofService[1];
