@@ -631,14 +631,26 @@ public class AofService {
             out.flush();
             tmpFos.getFD().sync();
 
+            // 换文件前关闭临时文件流：Windows 上 Files.move 要求源文件无打开句柄，
+            // 否则 move 抛 FileSystemException（POSIX 无此限制）。
+            // 关闭后 try-with-resources 的重复 close 为空操作（缓冲已排空、FOS close 幂等）。
+            out.close();
+
             synchronized (writeLock) {
-                // 仅关闭旧主 AOF 流；临时文件的 out 由 try-with-resources 自动关闭，
-                // 避免双 close 导致 BufferedOutputStream 对已关闭流再次 flush 抛异常。
+                // 关闭旧主 AOF 流（Windows 同样要求目标无打开句柄）
                 aofDataOut.close();
-
-                Files.move(tmpFile.toPath(), aofFile.toPath(), StandardCopyOption.REPLACE_EXISTING,
-                        StandardCopyOption.ATOMIC_MOVE);
-
+                try {
+                    Files.move(tmpFile.toPath(), aofFile.toPath(), StandardCopyOption.REPLACE_EXISTING,
+                            StandardCopyOption.ATOMIC_MOVE);
+                } catch (IOException moveFail) {
+                    // move 失败：旧文件未被替换仍然完好，重开续写，避免旧流已关闭导致
+                    // 后续写入静默落空（缓冲写入不抛异常、flush 异常被上层吞掉）
+                    log.error("AOF重写换文件失败，重开旧文件续写", moveFail);
+                    aofOut = new BufferedOutputStream(new FileOutputStream(aofFile, true),
+                            properties.getBufferSize());
+                    aofDataOut = new DataOutputStream(aofOut);
+                    throw moveFail;
+                }
                 aofOut = new BufferedOutputStream(new FileOutputStream(aofFile, true), properties.getBufferSize());
                 aofDataOut = new DataOutputStream(aofOut);
                 aofFileSize = aofFile.length();
