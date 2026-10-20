@@ -58,6 +58,12 @@ public final class InMemoryCapabilityStateStore implements CapabilityStateStore 
                 .toList();
     }
 
+    @Override
+    public void delete(NodeId node) {
+        java.util.Objects.requireNonNull(node, "node");
+        records.keySet().removeIf(key -> key.node().equals(node));
+    }
+
     private void mutate(NodeId node, CapabilityType type,
                         java.util.function.UnaryOperator<CapabilityRecord> updater) {
         lock.lock();

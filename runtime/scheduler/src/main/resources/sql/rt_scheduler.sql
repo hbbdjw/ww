@@ -4,5 +4,10 @@
 CREATE TABLE IF NOT EXISTS rt_scheduler_lease (
     id            INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
     owner         VARCHAR(64) NOT NULL,
-    expires_at_ms BIGINT      NOT NULL DEFAULT 0
+    expires_at_ms BIGINT      NOT NULL DEFAULT 0,
+    leader_epoch  BIGINT      NOT NULL DEFAULT 0
 );
+
+-- 存量库升级：P1-2 leader fencing token（每次换主单调递增，控制面写据此拒绝僵尸 leader）。
+ALTER TABLE rt_scheduler_lease
+    ADD COLUMN IF NOT EXISTS leader_epoch BIGINT NOT NULL DEFAULT 0;

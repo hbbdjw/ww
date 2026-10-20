@@ -7,6 +7,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
@@ -19,15 +20,23 @@ import java.util.Objects;
  *
  * <p>DDL 全部使用 {@code CREATE TABLE IF NOT EXISTS}，因此 bootstrap 是幂等的，
  * 可在节点启动路径上安全重复调用（PostgreSQL 方言）。</p>
+ *
+ * <p><b>v2 主键迁移：</b>放置表主键从 {@code (capability, partition_id)} 扩展为
+ * {@code (capability, partition_id, node_id)}（每分区多行：[0]=PRIMARY 其余 REPLICA）。
+ * bootstrap 检测旧主键表并 DROP 重建——放置为派生状态（可由 desired+alive 全量
+ * 重算），不做数据搬迁；重建期间该能力短暂无 owner，写入被 fencing 拒绝
+ * （安全侧失败），leader 调度器下周期自动 replaceAll 重新引导。</p>
  */
 public final class PlacementSchema {
 
     private static final String SQL_RESOURCE = "sql/rt_placement.sql";
 
+    private static final String TABLE = "rt_partition_placement";
+
     private PlacementSchema() {
     }
 
-    /** 幂等执行 classpath 下的 sql/rt_placement.sql。 */
+    /** 幂等执行 classpath 下的 sql/rt_placement.sql（含旧主键表检测重建）。 */
     public static void bootstrap(DataSource dataSource) {
         Objects.requireNonNull(dataSource, "dataSource");
         List<String> statements = splitStatements(readSql());
@@ -37,6 +46,9 @@ public final class PlacementSchema {
             // 并发竞态（pg_type 唯一键冲突），用会话级 advisory lock 互斥。
             stmt.execute("SELECT pg_advisory_lock(4001, 3)");
             try {
+                if (isLegacyTable(stmt)) {
+                    stmt.execute("DROP TABLE " + TABLE);
+                }
                 for (String sql : statements) {
                     stmt.execute(sql);
                 }
@@ -45,6 +57,36 @@ public final class PlacementSchema {
             }
         } catch (SQLException e) {
             throw new RuntimeFrameworkException("PlacementSchema.bootstrap failed: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * 检测旧主键表：查询 pg_index 中该表唯一/主键索引的列集，
+     * 不含 node_id 列即为旧表（需 DROP 重建）。
+     */
+    private static boolean isLegacyTable(Statement stmt) throws SQLException {
+        try (ResultSet rs = stmt.executeQuery("""
+                SELECT a.attname
+                FROM pg_index i
+                JOIN pg_class c ON c.oid = i.indrelid
+                JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY(i.indkey)
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = current_schema()
+                  AND c.relname = '%s'
+                  AND (i.indisprimary OR i.indisunique)
+                """.formatted(TABLE))) {
+            boolean hasNodeId = false;
+            boolean hasPartitionId = false;
+            while (rs.next()) {
+                if ("node_id".equals(rs.getString(1))) {
+                    hasNodeId = true;
+                }
+                if ("partition_id".equals(rs.getString(1))) {
+                    hasPartitionId = true;
+                }
+            }
+            // 表不存在（无任何索引列）→ 全新部署，非旧表
+            return hasPartitionId && !hasNodeId;
         }
     }
 

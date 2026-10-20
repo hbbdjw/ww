@@ -1,29 +1,8 @@
 package com.ww.runtime.data.storage;
 
-import com.ww.runtime.capability.CapabilityModule;
-import com.ww.runtime.capability.PlacementView;
-import com.ww.runtime.common.CapabilityType;
-import com.ww.runtime.common.NodeId;
-import com.ww.runtime.common.PartitionId;
-import com.ww.runtime.common.RuntimeFrameworkException;
-import com.ww.runtime.common.StaleEpochException;
-import com.ww.runtime.data.storage.engine.BucketInfo;
-import com.ww.runtime.data.storage.engine.BucketStore;
-import com.ww.runtime.data.storage.engine.ByteBufferPool;
-import com.ww.runtime.data.storage.engine.DriveManager;
-import com.ww.runtime.data.storage.engine.IdentityCryptoCodec;
-import com.ww.runtime.data.storage.engine.ObjectMetadata;
-import com.ww.runtime.data.storage.engine.ObjectMetadataCache;
-import com.ww.runtime.data.storage.engine.ObjectStore;
-import com.ww.runtime.data.storage.engine.SetLocator;
-import com.ww.runtime.data.storage.engine.StorageException;
-import com.ww.runtime.data.storage.engine.StorageProperties;
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
+import java.io.BufferedInputStream;
+import java.io.File;
+import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
@@ -41,6 +20,29 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.IntPredicate;
 import java.util.function.ToIntFunction;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.ww.runtime.capability.CapabilityModule;
+import com.ww.runtime.capability.PlacementView;
+import com.ww.runtime.common.CapabilityType;
+import com.ww.runtime.common.NodeId;
+import com.ww.runtime.common.PartitionId;
+import com.ww.runtime.common.RuntimeFrameworkException;
+import com.ww.runtime.common.StaleEpochException;
+import com.ww.runtime.data.storage.engine.BucketInfo;
+import com.ww.runtime.data.storage.engine.BucketStore;
+import com.ww.runtime.data.storage.engine.ByteBufferPool;
+import com.ww.runtime.data.storage.engine.DriveManager;
+import com.ww.runtime.data.storage.engine.IdentityCryptoCodec;
+import com.ww.runtime.data.storage.engine.MetadataIndex;
+import com.ww.runtime.data.storage.engine.ObjectMetadata;
+import com.ww.runtime.data.storage.engine.ObjectMetadataCache;
+import com.ww.runtime.data.storage.engine.ObjectStore;
+import com.ww.runtime.data.storage.engine.SetLocator;
+import com.ww.runtime.data.storage.engine.StorageException;
+import com.ww.runtime.data.storage.engine.StorageProperties;
+
 import tools.jackson.databind.ObjectMapper;
 
 /**
@@ -51,8 +53,9 @@ import tools.jackson.databind.ObjectMapper;
  * 节点间分区归属由 runtime placement 表决定。</p>
  *
  * <h2>fencing 写入规则</h2>
- * {@link #putObject} 前校验 {@code view.owner(STORAGE, partition)}，
- * 分区口径与调度器一致：{@code partitioner.applyAsInt(bucket + "/" + key)}。
+ * {@link #putObject} 前经 {@code view.checkWritable(STORAGE, partition, self, epoch)}
+ * 校验属主/纪元/新属主生效时间/本地租约；生产装配使用本地缓存视图与租约，
+ * 写路径不查询数据库。分区口径与调度器一致：{@code partitioner.applyAsInt(bucket + "/" + key)}。
  * 读/HEAD/列举不做 fencing（冻结/维护态仍可读）。
  *
  * <h2>副本数据面（网关/复制器调用，不做 fencing）</h2>
@@ -65,8 +68,9 @@ import tools.jackson.databind.ObjectMapper;
  *
  * <h2>迁移数据面</h2>
  * 单对象按 chunkSize 切片（{@link StorageChunkCodec}，仅 fin 片带终结符，
- * checkpoint 对齐对象边界）；导入端按 (bucket,key) 聚合分片，fin 片到达后
- * 经 {@link ObjectStore#putReplica} 原子落盘（version 防回退天然幂等）。
+ * checkpoint 对齐对象边界）；导入端经 {@link ImportAggregator} 按 (bucket,key)
+ * 流式聚合到暂存文件（零堆内聚合，T1），fin 片到达后经 {@link ObjectStore#putReplica}
+ * 原子落盘（version 防回退天然幂等）。
  */
 public final class StorageCapability implements CapabilityModule {
 
@@ -83,12 +87,49 @@ public final class StorageCapability implements CapabilityModule {
     private volatile BucketStore bucketStore;
     private volatile ObjectMetadataCache metaCache;
     private volatile boolean frozen;
+    /** 迁移 cutover 停写窗口：partition → 冻结到期（单调毫秒，TTL 自愈）。 */
+    private final java.util.concurrent.ConcurrentHashMap<Integer, Long> frozenPartitions =
+            new java.util.concurrent.ConcurrentHashMap<>();
     /** 桶注册表：PUT/导入/建桶自动登记；start() 从盘上 .bucket 重建。 */
     private final Set<String> buckets = ConcurrentHashMap.newKeySet();
-    /** 导入聚合：bucket\0key → 累积数据（fin 片到达后提交并移除）。 */
-    private final Map<String, ByteArrayOutputStream> importBuffers = new ConcurrentHashMap<>();
+    /** 导入聚合（T1）：bucket\0key → 暂存文件流式追加，消灭堆内聚合；fin 片到达后提交并移除。 */
+    private volatile ImportAggregator importAggregator;
     /** 主写/主删成功回调（复制器挂接；仅 {@link #putObject}/{@link #deleteObject} 触发）。 */
     private volatile WriteHook writeHook;
+    /** T11：崩溃残留周期 GC 调度器 */
+    private volatile java.util.concurrent.ScheduledExecutorService tempGcScheduler;
+    /** T9：隐式建桶计数（告警模式观测；切严格模式前须评估） */
+    private final java.util.concurrent.atomic.AtomicLong implicitBucketCreations =
+            new java.util.concurrent.atomic.AtomicLong();
+
+    // ------------------------------------------------------------------
+    // P0-1 半同步 at-risk 观测（降级模式下已应答但副本未确认的写）
+    // ------------------------------------------------------------------
+
+    /** at-risk 环形缓冲容量（有界防 OOM；淘汰最旧）。 */
+    private static final int AT_RISK_MAX_ENTRIES = 1_000;
+
+    /** 有界环形缓冲：满时淘汰最旧（保最新观测）。 */
+    private final java.util.Queue<AtRiskRecord> atRiskLog =
+            new java.util.concurrent.ConcurrentLinkedQueue<>();
+    /** at-risk 累计计数（含被淘汰条目，监控口径）。 */
+    private final java.util.concurrent.atomic.AtomicLong atRiskTotal =
+            new java.util.concurrent.atomic.AtomicLong();
+
+    /** at-risk 观测记录：已应答客户端但超时内无副本确认的写（降级模式）。 */
+    public record AtRiskRecord(String bucket, String key, long version, boolean delete,
+                               long atMs, String reason) {
+    }
+
+    /** at-risk 累计总数（监控/测试）。 */
+    public long atRiskTotal() {
+        return atRiskTotal.get();
+    }
+
+    /** at-risk 近期快照（管理面/测试；最多 {@value #AT_RISK_MAX_ENTRIES} 条，旧→新）。 */
+    public java.util.List<AtRiskRecord> atRiskSnapshot() {
+        return java.util.List.copyOf(atRiskLog);
+    }
 
     /**
      * 主写路径成功回调：本地直写与网关转发写（ForwardPut）统一触发，
@@ -102,6 +143,42 @@ public final class StorageCapability implements CapabilityModule {
 
         /** 主删成功（对象原本存在）。 */
         default void afterDelete(String bucket, String key) {
+        }
+
+        /**
+         * 主删成功（带被删对象版本）：版本随删除意图传播到副本，副本据此拒绝
+         * 「过期删除」抹掉更高版本的写入。
+         */
+        default void afterDelete(String bucket, String key, long version) {
+            afterDelete(bucket, key);
+        }
+
+        /**
+         * P0-1 半同步复制：主写落盘后、应答客户端前调用——同步推送并在 timeout 内
+         * 等待至少一个存活副本确认。
+         *
+         * <ul>
+         *   <li>分区无副本行（RF=1）→ 空真返回 true；</li>
+         *   <li>有副本行但无一存活 → 返回 false（降级信号，调用方按策略处理）；</li>
+         *   <li>超时内无任一副本确认 → false；失败的复制仍入 backlog 异步补偿。</li>
+         * </ul>
+         * 默认实现退化为异步 {@link #afterPut} 并返回 true（兼容既有实现/测试）。
+         */
+        default boolean replicateSync(String bucket, ObjectMetadata meta, java.time.Duration timeout) {
+            afterPut(bucket, meta);
+            return true;
+        }
+
+        /** 半同步副本删除：语义同 {@link #replicateSync}。默认退化为异步 {@link #afterDelete}。 */
+        default boolean replicateDeleteSync(String bucket, String key, java.time.Duration timeout) {
+            afterDelete(bucket, key);
+            return true;
+        }
+
+        /** 半同步副本删除（带版本护栏）。默认降级为无版本重载。 */
+        default boolean replicateDeleteSync(String bucket, String key, long version,
+                                            java.time.Duration timeout) {
+            return replicateDeleteSync(bucket, key, timeout);
         }
     }
 
@@ -146,7 +223,11 @@ public final class StorageCapability implements CapabilityModule {
         SetLocator locator = new SetLocator(dm);
         ByteBufferPool pool = new ByteBufferPool(props.getIoBufferSize(), props.getBufferPoolMaxSize());
         ObjectMapper mapper = new ObjectMapper();
-        ObjectStore store = new ObjectStore(dm, locator, new IdentityCryptoCodec(), mapper, pool);
+        // T3：元数据索引容量上限止血（超限桶列举降级目录扫描，正确性优先）
+        MetadataIndex index = new MetadataIndex(props.getMetadataIndexMaxEntries());
+        ObjectStore store = new ObjectStore(dm, locator, new IdentityCryptoCodec(), mapper, pool, index);
+        // T13：副本路径 fsync 可配置（默认与主路径一致）
+        store.setReplicaSkipFsync(props.isReplicaSkipFsync());
 
         // 元数据索引一次性重建：列举/计数走索引定位，避免全盘扫描 .meta 文件
         store.rebuildIndex();
@@ -157,15 +238,47 @@ public final class StorageCapability implements CapabilityModule {
         for (BucketInfo info : bs.listBuckets()) {
             this.buckets.add(info.getName());
         }
+        // T9 启动期对账告警：对象索引存在而桶注册缺失（隐式建桶仅内存登记的历史残留）
+        for (String indexedBucket : store.metadataIndex().bucketsSnapshot()) {
+            if (!buckets.contains(indexedBucket)) {
+                LOG.warn("T9 对象索引存在但桶注册缺失（历史隐式建桶残留，建议补建桶）: {}", indexedBucket);
+            }
+        }
 
         this.metaCache = props.getMetadataCacheMaxSize() > 0
                 ? new ObjectMetadataCache(props.getMetadataCacheMaxSize())
                 : null;
+        // T1：导入暂存聚合器（启动清扫重启残留 + 周期清扫超时聚合）
+        ImportAggregator aggregator = new ImportAggregator(
+                new File(props.getRootDir(), ".import-tmp"),
+                props.getImportStagingMaxAggregates(),
+                props.getMaxObjectSize(),
+                props.getImportStagingTimeoutMinutes());
+        aggregator.start();
+        this.importAggregator = aggregator;
         this.objectStore = store;
         this.bucketStore = bs;
         this.driveManager = dm;
         this.frozen = false;
-        this.importBuffers.clear();
+        // T22：新 store 实例代数重新计数——缓存必须失效
+        synchronized (snapshotLock) {
+            cachedSnapshots = null;
+            cachedGeneration = -1L;
+        }
+
+        // T11：崩溃残留启动清扫 + 周期 GC（年龄阈值防误删在途写）
+        store.sweepTempFiles(props.getTempSweepAgeMillis());
+        if (props.getTempGcIntervalMillis() > 0) {
+            this.tempGcScheduler = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "storage-temp-gc");
+                t.setDaemon(true);
+                return t;
+            });
+            long interval = props.getTempGcIntervalMillis();
+            this.tempGcScheduler.scheduleWithFixedDelay(
+                    () -> store.sweepTempFiles(props.getTempSweepAgeMillis()),
+                    interval, interval, java.util.concurrent.TimeUnit.MILLISECONDS);
+        }
     }
 
     @Override
@@ -181,7 +294,16 @@ public final class StorageCapability implements CapabilityModule {
     @Override
     public void stop() {
         frozen = true;
-        importBuffers.clear();
+        java.util.concurrent.ScheduledExecutorService gc = tempGcScheduler;
+        if (gc != null) {
+            gc.shutdownNow();
+            this.tempGcScheduler = null;
+        }
+        ImportAggregator aggregator = importAggregator;
+        if (aggregator != null) {
+            aggregator.close();
+        }
+        this.importAggregator = null;
         if (metaCache != null) {
             metaCache.clear();
         }
@@ -226,24 +348,87 @@ public final class StorageCapability implements CapabilityModule {
         }
         checkOwner(partitionOf(bucket, key));
         ObjectStore store = requireStarted();
-        buckets.add(bucket);
+        ensureBucketForWrite(bucket);
         InputStream bounded = new SizeLimitedInputStream(data, props.getMaxObjectSize());
         ObjectStore.StoredObject stored = store.putPrimary(bucket, key,
                 bounded, length, contentType, userMetadata);
+        // 长流式写期间可能发生 cutover/分区冻结：落盘后、应答前再校验一次属主，
+        // 避免“切主后仍向旧主 ack”的已确认写丢失（未 ack 的落盘由迁移清源回收）。
+        checkOwner(partitionOf(bucket, key));
         if (metaCache != null) {
             metaCache.put(bucket, key, stored.meta);
         }
         WriteHook hook = writeHook;
         if (hook != null) {
-            hook.afterPut(bucket, stored.meta);
+            if (!props.isSemiSyncEnabled()) {
+                hook.afterPut(bucket, stored.meta);
+            } else if (!hook.replicateSync(bucket, stored.meta,
+                    java.time.Duration.ofMillis(props.getSemiSyncTimeoutMs()))) {
+                handleSemiSyncTimeout(bucket, key, stored.meta.getVersion(), false);
+            }
         }
         return stored.meta;
     }
 
-    /** 读取对象（不做 fencing）。 */
+    /**
+     * P0-1 半同步超时处理：fail-closed → 抛 {@link ReplicationTimeoutException}（503，
+     * 宁可写失败也不应答可能随主节点死亡丢失的请求）；降级（默认）→ at-risk 观测后放行。
+     */
+    private void handleSemiSyncTimeout(String bucket, String key, long version, boolean delete) {
+        String reason = "semi-sync replication timeout after " + props.getSemiSyncTimeoutMs()
+                + "ms: no live replica ack for " + bucket + "/" + key;
+        if (props.isSemiSyncFailClosed()) {
+            throw new com.ww.runtime.common.ReplicationTimeoutException(reason);
+        }
+        recordAtRisk(bucket, key, version, delete, reason);
+    }
+    /** 降级模式记录 at-risk 观测（有界环形 + WARN，供监控/事后审计）。 */
+    private void recordAtRisk(String bucket, String key, long version, boolean delete, String reason) {
+        long total = atRiskTotal.incrementAndGet();
+        AtRiskRecord record = new AtRiskRecord(bucket, key, version, delete,
+                System.currentTimeMillis(), reason);
+        atRiskLog.add(record);
+        while (atRiskLog.size() > AT_RISK_MAX_ENTRIES) {
+            atRiskLog.poll();
+        }
+        LOG.warn("P0-1 at-risk write acknowledged without replica ack (total={}): {}/{} v{} delete={}",
+                total, bucket, key, version, delete);
+    }
+
+    /**
+     * 读取对象（不做 fencing）。
+     * <p>T18：GET 与 HEAD 共用元数据写穿缓存——命中缓存的 meta 直接定位数据文件，
+     * 免每次 GET 读盘解析 {@code object.meta}（旧实现仅 HEAD 用缓存，GET 恒回盘）。
+     * 缓存 miss 回源盘读并回填；删除/覆盖写经 {@link #deleteObject}/{@code putObject}
+     * 的 write-through/invalidate 保持一致。</p>
+     */
     public ObjectStore.StoredObject getObject(String bucket, String key) {
         ObjectStore store = objectStore;
-        return store == null ? null : store.get(bucket, key);
+        if (store == null) {
+            return null;
+        }
+        ObjectMetadataCache cache = metaCache;
+        if (cache != null) {
+            ObjectMetadata hit = cache.get(bucket, key);
+            if (hit != null) {
+                ObjectStore.StoredObject cached = store.get(bucket, key, hit);
+                if (cached != null) {
+                    return cached;
+                }
+                // 缓存命中但数据文件已消失（并发删除）：失效缓存回退盘读
+                cache.invalidate(bucket, key);
+            }
+        }
+        ObjectStore.StoredObject obj = store.get(bucket, key);
+        if (obj != null && cache != null) {
+            cache.put(bucket, key, obj.meta);
+        }
+        return obj;
+    }
+
+    /** 引擎观测口（包内可见：T15/T26 计数、T11 清扫等管理与测试用途）。 */
+    ObjectStore storeForTest() {
+        return objectStore;
     }
 
     /** HEAD（不做 fencing；LRU 缓存命中免盘）。 */
@@ -270,14 +455,23 @@ public final class StorageCapability implements CapabilityModule {
     public boolean deleteObject(String bucket, String key) {
         requireWritable();
         checkOwner(partitionOf(bucket, key));
-        boolean deleted = requireStarted().delete(bucket, key);
+        ObjectStore store = requireStarted();
+        ObjectMetadata before = store.head(bucket, key);
+        long deletedVersion = before == null ? -1L : before.getVersion();
+        boolean deleted = store.delete(bucket, key);
+        checkOwner(partitionOf(bucket, key));
         if (metaCache != null) {
             metaCache.invalidate(bucket, key);
         }
         if (deleted) {
             WriteHook hook = writeHook;
             if (hook != null) {
-                hook.afterDelete(bucket, key);
+                if (!props.isSemiSyncEnabled()) {
+                    hook.afterDelete(bucket, key, deletedVersion);
+                } else if (!hook.replicateDeleteSync(bucket, key, deletedVersion,
+                        java.time.Duration.ofMillis(props.getSemiSyncTimeoutMs()))) {
+                    handleSemiSyncTimeout(bucket, key, deletedVersion, true);
+                }
             }
         }
         return deleted;
@@ -297,9 +491,39 @@ public final class StorageCapability implements CapabilityModule {
     // 副本数据面 API（网关转发/复制器调用，不做 fencing）
     // ------------------------------------------------------------------
 
+    /**
+     * T9 灰度开关：写路径的桶存在性检查。
+     * <ul>
+     *   <li>告警模式（默认，strictBucketCheck=false）：未注册桶照旧隐式登记，
+     *       但 WARN + 计数——观察期收集真实流量中的隐式建桶场景；</li>
+     *   <li>严格模式（strictBucketCheck=true）：未建桶的 PUT 直接拒绝（对齐 S3 语义）。</li>
+     * </ul>
+     */
+    private void ensureBucketForWrite(String bucket) {
+        if (buckets.contains(bucket)) {
+            return;
+        }
+        if (props.isStrictBucketCheck()) {
+            throw new RuntimeFrameworkException("bucket not exists: " + bucket);
+        }
+        implicitBucketCreations.incrementAndGet();
+        LOG.warn("T9 隐式建桶（告警模式，累计 {} 次）: bucket={}", implicitBucketCreations.get(), bucket);
+        buckets.add(bucket);
+    }
+
+    /** T9：隐式建桶累计计数（观测口；切严格模式前须确认归零）。 */
+    public long getImplicitBucketCreations() {
+        return implicitBucketCreations.get();
+    }
+
     /** 副本写入：主节点预计算元数据直接落盘（version 防回退幂等）。 */
     public ObjectMetadata replicaPut(String bucket, String key, InputStream data,
                                       ObjectMetadata meta) {
+        // T25：冻结态不约束主写但必须约束副本写——drain/维护态继续接受副本写
+        // 会与迁移导出基线竞争，导致导出/校验口径漂移；漏掉的副本写由复制器 backlog 重放兜底
+        if (frozen) {
+            throw new RuntimeFrameworkException("frozen: replica write rejected");
+        }
         ObjectStore store = requireStarted();
         buckets.add(bucket);
         // T12：流式大小兜底（防 meta.size 撒谎），上限校验在 putReplica 版本跳过后生效
@@ -314,11 +538,54 @@ public final class StorageCapability implements CapabilityModule {
 
     /** 副本删除（非属主节点本地删除）。 */
     public boolean replicaDelete(String bucket, String key) {
-        boolean deleted = requireStarted().delete(bucket, key);
+        return replicaDelete(bucket, key, -1L);
+    }
+
+    /**
+     * 带版本护栏的副本删除：副本现有版本高于删除意图版本时拒绝（保留更新写入）；
+     * {@code version <= 0} 为旧协议的无版本删除。
+     */
+    public boolean replicaDelete(String bucket, String key, long version) {
+        ObjectStore store = requireStarted();
+        if (version > 0) {
+            ObjectMetadata existing = store.head(bucket, key);
+            if (existing != null && existing.getVersion() > version) {
+                LOG.info("stale replica delete ignored: {}/{} localV={} deleteV={}",
+                        bucket, key, existing.getVersion(), version);
+                return false;
+            }
+        }
+        boolean deleted = store.delete(bucket, key);
         if (metaCache != null) {
             metaCache.invalidate(bucket, key);
         }
         return deleted;
+    }
+
+    /** 可用于反熵删除的权威性判定：owner/epoch/validAfter/本地租约/冻结全部通过。 */
+    public boolean isWritablePrimary(int partition) {
+        try {
+            checkOwner(partition);
+            return true;
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
+    /**
+     * 反熵/backlog 用权威性判定：owner/epoch/validAfter/本地租约通过即可，
+     * 不受迁移冻结影响（冻结期本机仍是合法属主，只是暂停止写）。
+     */
+    public boolean isAuthoritativePrimary(int partition) {
+        if (!view.isReady(type())) {
+            return false;
+        }
+        try {
+            view.checkWritable(type(), PartitionId.of(partition), self, -1L);
+            return true;
+        } catch (RuntimeException e) {
+            return false;
+        }
     }
 
     // ------------------------------------------------------------------
@@ -428,22 +695,38 @@ public final class StorageCapability implements CapabilityModule {
      * @param skipObjects 跳过前 N 个完整对象（断点续跑：checkpoint = 已完成对象数）
      */
     public Iterator<byte[]> exportPartition(int partition, long skipObjects) {
+        return exportPartition(partition, skipObjects, null);
+    }
+
+    /**
+     * 键型游标导出版本：游标存在时忽略位置断点（位置断点在并发写入下会错位），
+     * 只导出严格位于游标 (bucket,key) 之后的存活对象。
+     */
+    public Iterator<byte[]> exportPartition(int partition, long skipObjects, String cursor) {
         if (skipObjects < 0) {
             throw new IllegalArgumentException("skipObjects must be >= 0, got " + skipObjects);
         }
+        if (cursor != null && cursor.isBlank()) {
+            cursor = null;
+        }
         ObjectStore store = requireStarted();
-        return new PartitionExportIterator(store, partition, skipObjects);
+        return new PartitionExportIterator(store, partition,
+                cursor == null ? skipObjects : 0L, cursor);
     }
 
     /**
      * 分区导出惰性迭代器：磁盘逐对象读取、按 chunkSize 逐片产出。
      * 任一时刻堆内至多持有当前对象的一个读缓冲 + 一个编码片。
+     * <p>T24：实现 {@link AutoCloseable}——迁移中止/异常/取消路径必须显式关闭，
+     * 消灭当前对象读流的 FD 泄漏（契约见 {@code PartitionDataAdapter#closeExportChunks}）。
      */
-    private final class PartitionExportIterator implements Iterator<byte[]> {
+    private final class PartitionExportIterator implements Iterator<byte[]>, AutoCloseable {
 
         private final ObjectStore store;
         private final int partition;
         private final Iterator<String> bucketIterator;
+        private final String cursorBucket;
+        private final String cursorKey;
         private long remainingSkips;
         private String currentBucket;
         private Iterator<ObjectMetadata> metaIterator;
@@ -455,9 +738,21 @@ public final class StorageCapability implements CapabilityModule {
         private boolean exhausted;
 
         PartitionExportIterator(ObjectStore store, int partition, long skipObjects) {
+            this(store, partition, skipObjects, null);
+        }
+
+        PartitionExportIterator(ObjectStore store, int partition, long skipObjects, String cursor) {
             this.store = store;
             this.partition = partition;
             this.remainingSkips = skipObjects;
+            if (cursor == null) {
+                this.cursorBucket = null;
+                this.cursorKey = null;
+            } else {
+                StorageChunkCodec.Cursor decoded = StorageChunkCodec.decodeCursor(cursor);
+                this.cursorBucket = decoded.bucket();
+                this.cursorKey = decoded.key();
+            }
             this.bucketIterator = sortedBuckets().iterator();
             this.metaIterator = Collections.emptyIterator();
         }
@@ -525,7 +820,7 @@ public final class StorageCapability implements CapabilityModule {
             }
         }
 
-        /** 按 bucket/key 字典序找下一个归属本分区且未被断点跳过的存活对象。 */
+        /** 按 bucket/key 字典序找下一个归属本分区、位于游标之后且未被断点跳过的存活对象。 */
         private ObjectStore.StoredObject nextMatchingObject() {
             while (true) {
                 while (!metaIterator.hasNext()) {
@@ -533,14 +828,25 @@ public final class StorageCapability implements CapabilityModule {
                         return null;
                     }
                     currentBucket = bucketIterator.next();
+                    // 游标之前的 bucket 整桶跳过（无需读 meta）
+                    if (cursorBucket != null && currentBucket.compareTo(cursorBucket) < 0) {
+                        continue;
+                    }
                     metaIterator = listAll(currentBucket, store).iterator();
                 }
                 ObjectMetadata meta = metaIterator.next();
                 if (partitionOf(currentBucket, meta.getKey()) != partition) {
                     continue;
                 }
+                if (cursorBucket != null) {
+                    int bucketCompare = currentBucket.compareTo(cursorBucket);
+                    if (bucketCompare < 0
+                            || (bucketCompare == 0 && meta.getKey().compareTo(cursorKey) <= 0)) {
+                        continue; // 已迁移对象（<= 游标）：并发写入下的稳定跳过
+                    }
+                }
                 if (remainingSkips > 0) {
-                    remainingSkips--; // 断点之前已完成迁移的对象整体跳过
+                    remainingSkips--; // 断点之前已完成迁移的对象整体跳过（无游标时的旧语义）
                     continue;
                 }
                 ObjectStore.StoredObject obj = store.get(currentBucket, meta.getKey());
@@ -563,17 +869,27 @@ public final class StorageCapability implements CapabilityModule {
             currentObject = null;
             readBuffer = null;
         }
+
+        /** T24：迁移中止/异常/取消路径强制关闭当前对象读流（FD 兜底）。 */
+        @Override
+        public void close() {
+            closeCurrentObject();
+            exhausted = true;
+            pending = null;
+        }
     }
 
     /**
-     * 导入分片（迁移目标端，不做 fencing）：按 (bucket,key) 聚合，
-     * fin 片到达后经 putReplica 原子落盘（同 version 跳过、低 version 拒收）。
+     * 导入分片（迁移目标端，不做 fencing）：按 (bucket,key) 经 {@link ImportAggregator}
+     * 流式聚合到暂存文件（零堆内聚合），fin 片到达后经 putReplica 原子落盘
+     * （同 version 跳过、低 version 拒收）。
      *
-     * @return 全部合法返回 true；分片非法/聚合残缺/偏移不连续返回 false
+     * @return 全部合法返回 true；分片非法/聚合残缺/偏移不连续/超限返回 false（内部已清聚合）
      */
     public boolean importChunks(List<byte[]> pieces) {
         Objects.requireNonNull(pieces, "pieces");
         ObjectStore store = requireStarted();
+        ImportAggregator aggregator = requireAggregator();
         long max = props.getMaxObjectSize();
         for (byte[] piece : pieces) {
             StorageChunkView chunk = StorageChunkCodec.decodeChunk(piece);
@@ -581,27 +897,27 @@ public final class StorageCapability implements CapabilityModule {
                 return false;
             }
             String aggKey = chunk.bucket() + "\0" + chunk.key();
-            ByteArrayOutputStream buf = importBuffers.computeIfAbsent(aggKey, k -> new ByteArrayOutputStream());
-            if (chunk.offset() != buf.size()) {
-                importBuffers.remove(aggKey);
-                return false; // 偏移不连续（残缺聚合/乱序）
-            }
-            // T12：聚合累计上限——超限即失败并清聚合，防止无界堆内聚合
-            if ((long) buf.size() + chunk.data().length > max) {
-                importBuffers.remove(aggKey);
-                LOG.warn("迁移导入聚合超出对象大小上限，中止：{}/{}（累计 {} > {}）",
-                        chunk.bucket(), chunk.key(), (long) buf.size() + chunk.data().length, max);
+            // 偏移不连续/字节超限/并发超限 → 中止聚合并返回 false（迁移引擎重发可恢复）
+            if (!aggregator.append(aggKey, chunk.data(), chunk.offset())) {
                 return false;
             }
-            buf.write(chunk.data(), 0, chunk.data().length);
             if (chunk.fin()) {
-                importBuffers.remove(aggKey);
-                byte[] all = buf.toByteArray();
-                if (all.length != chunk.meta().getSize()) {
-                    return false; // 尺寸与元数据不符
+                File staged = aggregator.finish(aggKey, chunk.meta().getSize());
+                if (staged == null) {
+                    return false; // 尺寸与元数据不符（聚合已中止清理）
                 }
-                store.putReplica(chunk.bucket(), chunk.key(), new ByteArrayInputStream(all),
-                        all.length, chunk.meta(), max);
+                try {
+                    // 暂存文件流式导入：FileInputStream 走 ObjectStore 的 sendfile 快路径
+                    try (InputStream in = new BufferedInputStream(new FileInputStream(staged))) {
+                        store.putReplica(chunk.bucket(), chunk.key(), in,
+                                staged.length(), chunk.meta(), max);
+                    }
+                } catch (IOException e) {
+                    throw new StorageException("迁移导入暂存读取失败: "
+                            + chunk.bucket() + "/" + chunk.key(), e);
+                } finally {
+                    staged.delete(); // 无论落盘成败均删暂存（失败由重发重建）
+                }
                 buckets.add(chunk.bucket()); // 迁入对象同样登记桶（导出扫描可见）
             }
         }
@@ -658,6 +974,9 @@ public final class StorageCapability implements CapabilityModule {
     public boolean servesPartitionOf(String bucket, String key) {
         Objects.requireNonNull(bucket, "bucket");
         Objects.requireNonNull(key, "key");
+        if (!view.isReady(type())) {
+            throw new RuntimeFrameworkException("placement view not ready for " + type());
+        }
         Optional<PlacementView.Owner> owner = view.owner(type(), PartitionId.of(partitionOf(bucket, key)));
         return owner.isEmpty() || owner.get().node().equals(self);
     }
@@ -687,11 +1006,36 @@ public final class StorageCapability implements CapabilityModule {
     // ------------------------------------------------------------------
 
     private void checkOwner(int partition) {
-        Optional<PlacementView.Owner> owner = view.owner(type(), PartitionId.of(partition));
-        if (owner.isEmpty() || !owner.get().node().equals(self)) {
-            long actual = owner.map(PlacementView.Owner::epoch).orElse(-1L);
-            throw new StaleEpochException(-1L, actual);
+        checkPartitionFrozen(partition);
+        if (!view.isReady(type())) {
+            throw new StaleEpochException("placement view not ready for " + type());
         }
+        view.checkWritable(type(), PartitionId.of(partition), self, -1L);
+    }
+
+    /**
+     * 迁移 cutover 停写：冻结该分区写入 {@code ttlMillis}（单调计时，到期自动解除）。
+     * 由迁移引擎在最终 SYNCING 前调用。
+     */
+    public void freezePartition(int partition, long ttlMillis) {
+        if (ttlMillis <= 0) {
+            frozenPartitions.remove(partition); // ttl<=0 = 立即解冻（迁移失败/完成回收）
+            return;
+        }
+        frozenPartitions.put(partition,
+                System.nanoTime() / 1_000_000L + ttlMillis);
+    }
+
+    private void checkPartitionFrozen(int partition) {
+        Long until = frozenPartitions.get(partition);
+        if (until == null) {
+            return;
+        }
+        if (System.nanoTime() / 1_000_000L < until) {
+            throw new StaleEpochException("partition " + partition
+                    + " frozen for migration cutover");
+        }
+        frozenPartitions.remove(partition, until);
     }
 
     private int partitionOf(String bucket, String key) {
@@ -711,8 +1055,29 @@ public final class StorageCapability implements CapabilityModule {
 
     /** 全量列举桶内对象（索引快照，按 key 排序）。 */
     private List<ObjectMetadata> listAll(String bucket, ObjectStore store) {
-        return store.snapshot(bucket);
+        synchronized (snapshotLock) {
+            long gen = store.indexGeneration();
+            if (cachedSnapshots == null || gen != cachedGeneration) {
+                cachedSnapshots = new java.util.HashMap<>();
+                cachedGeneration = gen;
+            }
+            List<ObjectMetadata> list = cachedSnapshots.get(bucket);
+            if (list == null) {
+                list = store.snapshot(bucket);
+                cachedSnapshots.put(bucket, list);
+            }
+            return list;
+        }
     }
+
+    /**
+     * T22 短期：按索引代数键控的桶快照复用——迁移流程（itemCount→export→clear→verify）
+     * 对同一冻结源端的多次全量列举仅在代数变化时重扫（读不动代数 → 全免扫；
+     * 任何写/删/清桶推进代数 → 自动失效重算），消除 O(操作数 × 桶对象数) 的重复快照拷贝。
+     */
+    private final Object snapshotLock = new Object();
+    private long cachedGeneration = -1L;
+    private Map<String, List<ObjectMetadata>> cachedSnapshots;
 
     private ObjectStore requireStarted() {
         ObjectStore store = objectStore;
@@ -720,6 +1085,14 @@ public final class StorageCapability implements CapabilityModule {
             throw new RuntimeFrameworkException("storage capability not started");
         }
         return store;
+    }
+
+    private ImportAggregator requireAggregator() {
+        ImportAggregator aggregator = importAggregator;
+        if (aggregator == null) {
+            throw new RuntimeFrameworkException("storage capability not started");
+        }
+        return aggregator;
     }
 
     private BucketStore requireBucketStore() {

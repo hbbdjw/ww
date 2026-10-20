@@ -21,7 +21,7 @@ import com.ww.runtime.common.CapabilityType;
  *       模块应拒绝新写（抛 {@code RuntimeFrameworkException("frozen")}）但保留读与存量数据。</li>
  * </ul>
  *
- * <h2>下一阶段接入点（兼容性交付物）</h2>
+ * <h2>接入点示例</h2>
  *
  * <h3>1. 包装 common/cache 的 SimpleCache 为缓存能力</h3>
  * <pre>{@code
@@ -45,7 +45,7 @@ import com.ww.runtime.common.CapabilityType;
  * }
  * }</pre>
  *
- * <h3>2. 包装 common/storage 的 ObjectStore/BucketStore 为对象存储能力</h3>
+ * <h3>2. 包装对象存储引擎（原 common/storage，现 runtime-data 的 storage/engine）为对象存储能力</h3>
  * <pre>{@code
  * final class ObjectStoreCapabilityModule implements CapabilityModule {
  *     private final ObjectStore objects;

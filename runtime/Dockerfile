@@ -26,4 +26,9 @@ EXPOSE 9100
 #   容器同名重启/后启动场景下，负缓存会导致 gRPC channel 永久 Unable to resolve host
 ENV LANG=C.UTF-8
 ENV TZ=Asia/Shanghai
-ENTRYPOINT ["java", "-Dfile.encoding=UTF-8", "-Duser.timezone=Asia/Shanghai", "-Dsun.net.inetaddr.negative.ttl=0", "-Dsun.net.inetaddr.ttl=10", "-jar", "app.jar"]
+# 显式钉住 JVM 堆：迁移 exportPartition 会把分区数据批量载入堆，
+# 默认人体工学堆（容器内存 1/4）在 8 并发迁移下极易 OOM。
+# HeapDumpOnOutOfMemoryError 保留现场：容器 restart: "no" 保持 exited，
+# 事后 docker cp <容器>:/app/data/heapdump.hprof 取出分析。
+ENV JAVA_OPTS="-Xms4g -Xmx4g -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/app/data/heapdump.hprof"
+ENTRYPOINT ["sh", "-c", "exec java $JAVA_OPTS -Dfile.encoding=UTF-8 -Duser.timezone=Asia/Shanghai -Dsun.net.inetaddr.negative.ttl=0 -Dsun.net.inetaddr.ttl=10 -jar app.jar"]

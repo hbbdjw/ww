@@ -1,10 +1,14 @@
 package com.ww.runtime.data;
 
+import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
+import java.util.function.IntPredicate;
 
+import com.ww.runtime.common.NodeId;
 import com.ww.runtime.migration.PartitionDataAdapter;
 
 /**
@@ -13,7 +17,11 @@ import com.ww.runtime.migration.PartitionDataAdapter;
  *
  * <p>MigrationEngine 与 MigrationServer 注入本组合适配器后，同一迁移引擎
  * 即可驱动所有能力的分区数据搬迁；MOCK 分支直接委托原
- * {@code MockPartitionAdapter} 实例，既有行为零变化。
+ * {@code MockPartitionAdapter} 实例，既有行为零变化。</p>
+ *
+ * <p><b>能力扩展</b>：新能力（如后续 STORAGE 的源端清理/启动清扫）只需在其
+ * PartitionDataAdapter 实现中覆写 {@code clearPartition/retainPartitions/compact}，
+ * 本组合器与调度/迁移/清扫框架无需任何改动。</p>
  */
 public final class CompositePartitionAdapter implements PartitionDataAdapter {
 
@@ -27,14 +35,40 @@ public final class CompositePartitionAdapter implements PartitionDataAdapter {
         this.delegates = Map.copyOf(delegates);
     }
 
+    /** 已注册能力集合（启动清扫器遍历用）。 */
+    public Set<String> capabilities() {
+        return delegates.keySet();
+    }
+
     @Override
     public long itemCount(String capability, int partition) {
         return delegate(capability).itemCount(capability, partition);
     }
 
     @Override
-    public List<byte[]> exportChunks(String capability, int partition, long fromCheckpoint) {
+    public Iterator<byte[]> exportChunks(String capability, int partition, long fromCheckpoint) {
         return delegate(capability).exportChunks(capability, partition, fromCheckpoint);
+    }
+
+    @Override
+    public Iterator<byte[]> exportChunks(String capability, int partition, long fromCheckpoint,
+                                         String cursor) {
+        return delegate(capability).exportChunks(capability, partition, fromCheckpoint, cursor);
+    }
+
+    @Override
+    public String cursorOf(String capability, byte[] piece) {
+        return delegate(capability).cursorOf(capability, piece);
+    }
+
+    @Override
+    public boolean supportsCursorResume() {
+        return delegates.values().stream().anyMatch(PartitionDataAdapter::supportsCursorResume);
+    }
+
+    @Override
+    public boolean freezePartition(String capability, int partition, long ttlMillis) {
+        return delegate(capability).freezePartition(capability, partition, ttlMillis);
     }
 
     @Override
@@ -45,6 +79,21 @@ public final class CompositePartitionAdapter implements PartitionDataAdapter {
     @Override
     public long verifyCount(String capability, int partition) {
         return delegate(capability).verifyCount(capability, partition);
+    }
+
+    @Override
+    public boolean clearPartition(String capability, int partition, NodeId source) {
+        return delegate(capability).clearPartition(capability, partition, source);
+    }
+
+    @Override
+    public long retainPartitions(String capability, IntPredicate keep) {
+        return delegate(capability).retainPartitions(capability, keep);
+    }
+
+    @Override
+    public void compact(String capability) {
+        delegate(capability).compact(capability);
     }
 
     private PartitionDataAdapter delegate(String capability) {

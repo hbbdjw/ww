@@ -26,6 +26,9 @@ message FetchReq {
   string capability = 1;
   int32 partition_id = 2;
   int64 from_checkpoint = 3;
+  // 键型断点游标（不透明）：非空时源端只导出严格位于游标之后的条目，
+  // 抵御并发写入导致的位置断点错位。
+  string from_cursor = 4;
 }
 
 message TaskControlReq {
@@ -52,10 +55,36 @@ message ProgressSummary {
   string message = 2;
 }
 
-// 分区迁移：双向流传输 / 拉取 / 任务控制 / 进度上报
+// 源端分区条目计数（迁移 SNAPSHOT/VERIFYING 对账用）
+message CountReqP {
+  string capability = 1;
+  int32 partition_id = 2;
+}
+
+message CountAckP {
+  int64 count = 1;
+}
+
+// 源端分区数据清理（迁移完成后释放源端内存/持久化空间）
+message ClearReqP {
+  string capability = 1;
+  int32 partition_id = 2;
+}
+
+// 迁移 cutover 停写：冻结源端分区写入 ttl_millis（到期自动解除；ttl<=0 立即解冻）
+message FreezePartitionReqP {
+  string capability = 1;
+  int32 partition_id = 2;
+  int64 ttl_millis = 3;
+}
+
+// 分区迁移：双向流传输 / 拉取 / 任务控制 / 进度上报 / 源端计数 / 源端清理 / 源端停写
 service Migration {
   rpc TransferStream(stream DataChunkP) returns (stream ChunkAckP);
   rpc FetchPartition(FetchReq) returns (stream DataChunkP);
   rpc ControlTask(TaskControlReq) returns (TaskAck);
   rpc ReportProgress(stream ProgressReport) returns (ProgressSummary);
+  rpc CountPartition(CountReqP) returns (CountAckP);
+  rpc ClearPartition(ClearReqP) returns (TaskAck);
+  rpc FreezePartition(FreezePartitionReqP) returns (TaskAck);
 }

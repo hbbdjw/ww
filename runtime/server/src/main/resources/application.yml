@@ -4,7 +4,18 @@
 spring:
   application:
     name: runtime-server
-  # PostgreSQL 连接（HikariCP 由 spring-boot-starter-jdbc 自动装配；仅 runtime.store=jdbc 时使用）
+  mvc:
+    async:
+      # 长流式响应（大文件下载 / 视频边下边播）不被 Servlet 异步超时截断，对齐 Tomcat connection-timeout
+      request-timeout: 3600000
+  web:
+    resources:
+      cache:
+        cachecontrol:
+          # 静态资源（控制台 index.html + assets）一律协商缓存（ETag/304）：
+          # 重部署后浏览器立即拿到新页面，杜绝旧 bundle 驻留导致的"改完代码线上没变"
+          no-cache: true
+  # PostgreSQL 连接（HikariCP 由 spring-boot-starter-jdbc 自动装配，仅 runtime.store=jdbc 时使用）
   datasource:
     url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/ww}
     username: ${SPRING_DATASOURCE_USERNAME:ww}
@@ -13,6 +24,15 @@ spring:
 server:
   # REST 管理端点端口（gRPC 端口见 runtime.node.grpc-port）
   port: ${SERVER_PORT:8080}
+  tomcat:
+    # 大文件上传：禁用 Tomcat 表单 POST 大小限制（我们用 PUT 流式上传，不走 multipart 解析）
+    max-http-form-post-size: -1
+    # 连接超时（毫秒），大文件上传需要更长时间
+    connection-timeout: 3600000
+    # 保持连接超时
+    keep-alive-timeout: 60000
+  # 请求头大小上限
+  max-http-request-header-size: 65536
 
 runtime:
   node:
@@ -26,9 +46,37 @@ runtime:
   # 持久化模式：jdbc（PostgreSQL，默认）| memory（进程内，单测/单机演示，不建任何 JDBC 仓库）
   store: ${RUNTIME_STORE:jdbc}
 
+  # 数据面路由：本地放置视图 + 本地租约 fencing；db=回滚为每次查库（Phase 1 开关）
+  route:
+    mode: ${RUNTIME_ROUTE_MODE:cache}
+    view-refresh-ms: ${RUNTIME_ROUTE_VIEW_REFRESH_MS:500}
+    # 兜底全量重载（覆盖混合版本升级/漏推进修订号）；滚动升级期间可临时调小到 30000
+    full-refresh-ms: ${RUNTIME_ROUTE_FULL_REFRESH_MS:300000}
+    directory-refresh-ms: ${RUNTIME_ROUTE_DIRECTORY_REFRESH_MS:1000}
+  # Phase 2：数据面写租约（后台批量续约，写路径只查本地租约）
+  # 约束：lease-renew-ms + safety-margin-ms < lease-ttl-ms
+  fence:
+    lease-ttl-ms: ${RUNTIME_FENCE_LEASE_TTL_MS:5000}
+    lease-renew-ms: ${RUNTIME_FENCE_LEASE_RENEW_MS:1000}
+    safety-margin-ms: ${RUNTIME_FENCE_SAFETY_MARGIN_MS:1000}
+    lease-batch-size: ${RUNTIME_FENCE_LEASE_BATCH_SIZE:256}
+
   heartbeat-interval-ms: ${RUNTIME_HEARTBEAT_INTERVAL_MS:1000}
+  # 固定超时仅作 φ 暖窗期（冷启动/重连样本不足）回退判定
   suspect-after-misses: ${RUNTIME_SUSPECT_AFTER_MISSES:3}
   dead-after-misses: ${RUNTIME_DEAD_AFTER_MISSES:6}
+  # Phi Accrual 自适应故障检测：φ=-log10(健康但心跳晚于当前静默时长的概率)
+  # φ=3≈0.1% 误判概率（SUSPECTED）；φ=8≈亿分之一（DEAD，Cassandra/Akka 同级阈值）
+  phi-suspect-threshold: ${RUNTIME_PHI_SUSPECT_THRESHOLD:3.0}
+  phi-dead-threshold: ${RUNTIME_PHI_DEAD_THRESHOLD:8.0}
+  # φ 连续多少个检测周期超过死阈值才升级 DEAD（防 GC/网络瞬时抖动一击判死）
+  dead-confirmations: ${RUNTIME_DEAD_CONFIRMATIONS:2}
+  phi-max-sample-size: ${RUNTIME_PHI_MAX_SAMPLE_SIZE:200}
+  phi-min-samples: ${RUNTIME_PHI_MIN_SAMPLES:3}
+  # 心跳间隔标准差下限（毫秒）：稳态零方差时防止检测器瞬间过敏
+  phi-min-std-deviation-ms: ${RUNTIME_PHI_MIN_STD_DEVIATION_MS:100}
+  # 可接受暂停（毫秒）：窗口内静默不计怀疑度，容忍 GC/调度停顿（0=不额外宽限）
+  phi-acceptable-pause-ms: ${RUNTIME_PHI_ACCEPTABLE_PAUSE_MS:0}
 
   scheduler:
     ttl-ms: ${RUNTIME_SCHEDULER_TTL_MS:10000}
@@ -39,6 +87,16 @@ runtime:
   replication-factor: ${RUNTIME_REPLICATION_FACTOR:1}
   min-move-ratio: ${RUNTIME_MIN_MOVE_RATIO:0.10}
   rebalance-cooldown-ms: ${RUNTIME_REBALANCE_COOLDOWN_MS:30000}
+  # P0-2 隔离治愈开关（默认 true）：无存活副本分区治愈宽限期赌输后标记 DEGRADED 隔离——
+  # 放置保持指向死亡属主（数据留盘押注重启），数据面拒绝服务直至属主回归或人工
+  # force-adopt（/rt/degraded/**）；false 回退旧的「空分区迁移」静默丢失路径（仅回滚对照）
+  healing-quarantine-enabled: ${RUNTIME_HEALING_QUARANTINE_ENABLED:true}
+  # 多级故障确认（PFAIL→FAIL）：默认关闭——开启后本地 φ 判 DEAD 只投怀疑票，
+  # leader 按 TTL 内多数独立观察者票数（floor((N-1)/2)+1）唯一提升注册表 DEAD，
+  # 防止非对称分区下单个观察者误判引爆治愈/重平衡。滚动升级请全量升级后再开启。
+  suspicion-vote-ttl-ms: ${RUNTIME_SUSPICION_VOTE_TTL_MS:12000}
+  suspicion-min-observers: ${RUNTIME_SUSPICION_MIN_OBSERVERS:1}
+  suspicion-quorum-enabled: ${RUNTIME_SUSPICION_QUORUM_ENABLED:false}
 
   migration:
     max-concurrent: ${RUNTIME_MIGRATION_MAX_CONCURRENT:2}
@@ -47,18 +105,35 @@ runtime:
     ack-window: ${RUNTIME_MIGRATION_ACK_WINDOW:8}
 
   capabilities:
-    # 启动时自动把本节点 MOCK 期望态写为 ACTIVE（调度器随即拉起）；单测关闭后手动 PUT desired 验证
+    # 启动时自动把本节点 MOCK 期望态写为 ACTIVE（仅【首次启动】生效——管理面已显式设置过期望态的节点，重启后保持数据库中的值不被 env 覆盖）；单测关闭后手动 PUT desired 验证
     mock-desired: ${RUNTIME_CAPABILITIES_MOCK_DESIRED:true}
-    # CACHE 能力：启动时自动写期望态 ACTIVE（默认 false，显式开启避免多能力 placement 引导风暴）
+    # CACHE 能力：首启写期望态 ACTIVE（仅首次启动生效，同上；默认 false，显式开启避免多能力 placement 引导风暴）
     cache-desired: ${RUNTIME_CAPABILITIES_CACHE_DESIRED:false}
-    # CACHE AOF 持久化开关与目录
+    # CACHE AOF 持久化开关与目录（生产开启后：崩溃重启回放恢复 + 迁移数据随节点流转）
     cache-aof-enabled: ${RUNTIME_CAPABILITIES_CACHE_AOF_ENABLED:false}
     cache-data-dir: ${RUNTIME_CAPABILITIES_CACHE_DATA_DIR:./data/cache}
+    # CACHE 专属副本数（默认 1：cache 无复制器，>1 会产生幽灵副本，故障提升即静默丢数据）
+    cache-replication-factor: ${RUNTIME_CAPABILITIES_CACHE_REPLICATION_FACTOR:1}
+    # CACHE 内存治理：key 数上限 / 近似字节水位（0=不启用字节维度淘汰）
+    cache-max-size: ${RUNTIME_CAPABILITIES_CACHE_MAX_SIZE:100000}
+    cache-max-memory-bytes: ${RUNTIME_CAPABILITIES_CACHE_MAX_MEMORY_BYTES:0}
+    # CACHE Stream 子系统上限（0=不限；默认给出生产可用的安全水位）
+    cache-stream-max-len: ${RUNTIME_CAPABILITIES_CACHE_STREAM_MAX_LEN:1000000}
+    cache-pel-max-entries: ${RUNTIME_CAPABILITIES_CACHE_PEL_MAX_ENTRIES:1000000}
+    cache-max-streams: ${RUNTIME_CAPABILITIES_CACHE_MAX_STREAMS:10000}
     # STORAGE 能力：启动时自动写期望态 ACTIVE（默认 false）
     storage-desired: ${RUNTIME_CAPABILITIES_STORAGE_DESIRED:false}
     # STORAGE 本地 Drive 路径（逗号分隔；为空时退化为 storage-data-dir 单 Drive）
     storage-drives: ${RUNTIME_CAPABILITIES_STORAGE_DRIVES:}
     storage-data-dir: ${RUNTIME_CAPABILITIES_STORAGE_DATA_DIR:./data/storage}
+    # P0-1 半同步复制（默认关=既有异步语义，滚动升级安全）：开启后主写落盘须在超时内
+    # 获得 ≥1 个存活副本确认才应答客户端，杜绝「已 ack 的写随主节点死亡而静默丢失」
+    storage-semi-sync-enabled: ${RUNTIME_CAPABILITIES_STORAGE_SEMI_SYNC_ENABLED:false}
+    # 半同步等待副本确认的超时（毫秒）：副本不可达时写延迟至多增加该值
+    storage-semi-sync-timeout-ms: ${RUNTIME_CAPABILITIES_STORAGE_SEMI_SYNC_TIMEOUT_MS:2000}
+    # 半同步超时策略：false=降级应答（WARN + at-risk 观测后照常返回，可用性优先）；
+    # true=fail-closed（503 拒绝，一致性优先——宁可写失败也不应答可能丢失的请求）
+    storage-semi-sync-fail-closed: ${RUNTIME_CAPABILITIES_STORAGE_SEMI_SYNC_FAIL_CLOSED:false}
 
   # 日志采集与实时推送（rt_log 落库 + /rt/log/stream SSE + 跨节点 gRPC 聚合）
   log:
@@ -70,3 +145,10 @@ runtime:
     flush-interval-ms: ${RUNTIME_LOG_FLUSH_INTERVAL_MS:1000}
     # 内存队列容量（满时丢弃新日志并计数，不阻塞业务线程）
     queue-capacity: ${RUNTIME_LOG_QUEUE_CAPACITY:10000}
+
+  # 安全与会话（会话/权限数据缓存于集群 CACHE 能力，要求 CACHE 能力 ACTIVE）
+  security:
+    # 会话不活跃超时（分钟）：每次访问滑动续期，超时/登出即失效
+    session-timeout-minutes: ${RUNTIME_SECURITY_SESSION_TIMEOUT_MINUTES:30}
+    # 用户权限缓存有效期（分钟）：用户/角色/菜单变更立即淘汰，DB 始终为权限真源
+    permission-cache-minutes: ${RUNTIME_SECURITY_PERMISSION_CACHE_MINUTES:10}

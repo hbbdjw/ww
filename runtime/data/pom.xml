@@ -12,7 +12,7 @@
 
     <artifactId>runtime-data</artifactId>
     <name>runtime-data</name>
-    <description>数据面能力实现：CACHE（SimpleCache 包装）与 STORAGE（ObjectStore 包装）
+    <description>数据面能力实现：CACHE（cache/engine 内化引擎 + 网关转发）与 STORAGE（ObjectStore 包装）
         的 CapabilityModule + PartitionDataAdapter，集群调度由 runtime 框架统一驱动</description>
 
     <dependencies>
@@ -36,38 +36,11 @@
             <artifactId>runtime-placement</artifactId>
             <version>1.0-SNAPSHOT</version>
         </dependency>
-
-        <!-- 本地引擎复用：仅取 SimpleCache/AofService/Codec 与 ObjectStore/DriveManager/SetLocator
-             等纯引擎类；common 模块的 Spring starter 传递依赖全部排除，保持本模块零 Spring。 -->
+        <!-- 数据面 gRPC 契约（storage.proto：网关转发 / 副本复制 / fan-out 列举 / 桶同步） -->
         <dependency>
             <groupId>com.ww</groupId>
-            <artifactId>cache</artifactId>
+            <artifactId>runtime-proto</artifactId>
             <version>1.0-SNAPSHOT</version>
-            <exclusions>
-                <exclusion>
-                    <groupId>org.springframework.boot</groupId>
-                    <artifactId>*</artifactId>
-                </exclusion>
-                <exclusion>
-                    <groupId>org.springframework</groupId>
-                    <artifactId>*</artifactId>
-                </exclusion>
-            </exclusions>
-        </dependency>
-        <dependency>
-            <groupId>com.ww</groupId>
-            <artifactId>storage</artifactId>
-            <version>1.0-SNAPSHOT</version>
-            <exclusions>
-                <exclusion>
-                    <groupId>org.springframework.boot</groupId>
-                    <artifactId>*</artifactId>
-                </exclusion>
-                <exclusion>
-                    <groupId>org.springframework</groupId>
-                    <artifactId>*</artifactId>
-                </exclusion>
-            </exclusions>
         </dependency>
 
         <!-- ObjectStore 元数据序列化（Jackson 3，版本由 Spring Boot 父 POM 管理） -->

@@ -3,7 +3,9 @@ package com.ww.runtime.placement;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.Deque;
 import java.util.Objects;
+import java.util.concurrent.ConcurrentLinkedDeque;
 
 /**
  * key → partition 的静态映射函数。
@@ -15,13 +17,12 @@ import java.util.Objects;
  */
 public final class Partitioner {
 
-    private static final ThreadLocal<MessageDigest> MD5_LOCAL = ThreadLocal.withInitial(() -> {
-        try {
-            return MessageDigest.getInstance("MD5");
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException("MD5 algorithm not available", e);
-        }
-    });
+    /** MD5 MessageDigest 对象池：虚拟线程下 ThreadLocal 会为每个虚拟线程创建独立实例，
+     *  改用共享池避免实例爆炸（数据热路径每次读写都经过 {@link #partition}）。 */
+    private static final Deque<MessageDigest> MD5_POOL = new ConcurrentLinkedDeque<>();
+
+    /** 池上限，防止无限增长。 */
+    private static final int MD5_POOL_MAX = 64;
 
     private Partitioner() {
     }
@@ -40,14 +41,36 @@ public final class Partitioner {
         return (int) (unsigned % partitionCount);
     }
 
-    private static long hash(String input) {
-        MessageDigest md = MD5_LOCAL.get();
-        md.reset();
-        byte[] digest = md.digest(input.getBytes(StandardCharsets.UTF_8));
-        long h = 0;
-        for (int i = 0; i < 8; i++) {
-            h = (h << 8) | (digest[i] & 0xFF);
+    private static MessageDigest borrowMd5() {
+        MessageDigest md = MD5_POOL.pollFirst();
+        if (md != null) {
+            return md;
         }
-        return h;
+        try {
+            return MessageDigest.getInstance("MD5");
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("MD5 algorithm not available", e);
+        }
+    }
+
+    private static void returnMd5(MessageDigest md) {
+        if (MD5_POOL.size() < MD5_POOL_MAX) {
+            MD5_POOL.offerFirst(md);
+        }
+    }
+
+    private static long hash(String input) {
+        MessageDigest md = borrowMd5();
+        try {
+            md.reset();
+            byte[] digest = md.digest(input.getBytes(StandardCharsets.UTF_8));
+            long h = 0;
+            for (int i = 0; i < 8; i++) {
+                h = (h << 8) | (digest[i] & 0xFF);
+            }
+            return h;
+        } finally {
+            returnMd5(md);
+        }
     }
 }

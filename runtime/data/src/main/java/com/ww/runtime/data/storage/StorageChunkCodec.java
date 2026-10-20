@@ -114,4 +114,70 @@ public final class StorageChunkCodec {
         }
         return -1;
     }
+
+    // ------------------------------------------------------------------
+    // 键型断点游标（迁移并发写入场景：位置断点会因字典序插入/删除而错位）
+    // ------------------------------------------------------------------
+
+    /** 游标（bucket/key 二元组，按导出顺序自然排序）。 */
+    public record Cursor(String bucket, String key) {
+    }
+
+    /**
+     * 从一个分片中提取对象级游标：仅 fin 片（完整对象）产出，非 fin 片返回 null。
+     * 只解析 header，不解码数据片（避免对每个中间片做大块 Base64 解码）。
+     */
+    public static String cursorOf(byte[] chunk) {
+        if (chunk == null || chunk.length == 0
+                || chunk[chunk.length - 1] != ChunkCodec.SEP_ENTRY) {
+            return null;
+        }
+        int sep = indexOf(chunk, ChunkCodec.SEP_KV, 0);
+        int headerEnd = chunk.length - 1;
+        if (sep < 0 || sep >= headerEnd) {
+            return null;
+        }
+        try {
+            JsonNode h = MAPPER.readTree(
+                    new String(chunk, 0, sep, StandardCharsets.UTF_8));
+            return encodeCursor(h.get("bucket").asString(), h.get("key").asString());
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    /** 编码游标：Base64Url(bucket UTF-8 + 0x00 + key UTF-8)。 */
+    public static String encodeCursor(String bucket, String key) {
+        byte[] b = bucket.getBytes(StandardCharsets.UTF_8);
+        byte[] k = key.getBytes(StandardCharsets.UTF_8);
+        byte[] joined = new byte[b.length + 1 + k.length];
+        System.arraycopy(b, 0, joined, 0, b.length);
+        joined[b.length] = 0;
+        System.arraycopy(k, 0, joined, b.length + 1, k.length);
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(joined);
+    }
+
+    public static Cursor decodeCursor(String cursor) {
+        byte[] joined = Base64.getUrlDecoder().decode(cursor);
+        int sep = 0;
+        while (sep < joined.length && joined[sep] != 0) {
+            sep++;
+        }
+        if (sep >= joined.length) {
+            throw new IllegalArgumentException("invalid storage migration cursor");
+        }
+        return new Cursor(new String(joined, 0, sep, StandardCharsets.UTF_8),
+                new String(joined, sep + 1, joined.length - sep - 1, StandardCharsets.UTF_8));
+    }
+
+    /** (bucket,key) 是否严格位于游标之后（与导出排序完全一致）。 */
+    public static boolean isAfterCursor(String bucket, String key, String cursor) {
+        if (cursor == null) {
+            return true;
+        }
+        Cursor decoded = decodeCursor(cursor);
+        int bucketCompare = bucket.compareTo(decoded.bucket());
+        return bucketCompare > 0
+                || (bucketCompare == 0 && key.compareTo(decoded.key()) > 0);
+    }
 }

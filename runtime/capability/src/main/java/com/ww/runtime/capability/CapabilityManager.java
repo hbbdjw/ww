@@ -13,6 +13,8 @@ import com.ww.runtime.common.Clock;
 import com.ww.runtime.common.IllegalStateTransitionException;
 import com.ww.runtime.common.NodeId;
 import com.ww.runtime.common.RuntimeFrameworkException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * 能力管理器（单节点视角）：管理<b>本节点</b>上全部已注册 {@link CapabilityModule}
@@ -46,6 +48,8 @@ import com.ww.runtime.common.RuntimeFrameworkException;
  */
 public final class CapabilityManager {
 
+    private static final Logger LOG = LoggerFactory.getLogger(CapabilityManager.class);
+
     private static final Map<CapabilityState, Set<CapabilityState>> LEGAL_TRANSITIONS = Map.of(
             CapabilityState.DISABLED, EnumSet.of(CapabilityState.STARTING),
             CapabilityState.STARTING, EnumSet.of(CapabilityState.WARMING, CapabilityState.FAILED),
@@ -61,6 +65,8 @@ public final class CapabilityManager {
     private final CapabilityStateStore store;
     private final Clock clock;
     private final Map<CapabilityType, CapabilityModule> modules = new ConcurrentHashMap<>();
+    /** 冻结前钩子（如 STORAGE 在 freeze 前排空副本复制 backlog，确保副本已追平）。 */
+    private final Map<CapabilityType, Runnable> freezeHooks = new ConcurrentHashMap<>();
     /** per-type 锁：同一能力的跃迁/钩子串行化，不同能力互不阻塞（枚举 key，无膨胀）。 */
     private final Map<CapabilityType, Object> typeLocks = new ConcurrentHashMap<>();
 
@@ -95,9 +101,10 @@ public final class CapabilityManager {
         if (existing.isEmpty()) {
             store.setActual(self, module.type(), CapabilityState.DISABLED);
         } else if (existing.get().actual() != CapabilityState.DISABLED) {
-            // 进程重启：本节点能力模块必然未运行，actual 归位 DISABLED（desired 保留）。否则上一代
-            // 遗留的 desired==actual==ACTIVE 会让调度器判定无需拉起，模块实际未启动而状态表显示 ACTIVE，
-            // 迁移任务执行其数据面即连环 "capability not started" 失败（actual 由本节点状态机自治产出）。
+            // 进程重启：本节点能力模块必然未运行，actual 归位 DISABLED（desired 保留），
+            // 由调度器据 desired 重新拉起。遗留的 desired==actual==ACTIVE 若不归位，
+            // 调度器会判定无需拉起，导致状态表显示 ACTIVE 而模块实际未启动
+            // （actual 由本节点状态机自治产出）。
             store.setActual(self, module.type(), CapabilityState.DISABLED);
         }
     }
@@ -298,9 +305,29 @@ public final class CapabilityManager {
 
     /**
      * 冻结/解冻：仅透传模块钩子，<b>不改变</b>状态机状态。
+     * 冻结前先执行已注册钩子（尽力而为，失败仅告警不阻断冻结——冻结本身是安全方向）。
      */
     public void freeze(CapabilityType type, boolean frozen) {
+        if (frozen) {
+            Runnable hook = freezeHooks.get(type);
+            if (hook != null) {
+                try {
+                    hook.run();
+                } catch (RuntimeException e) {
+                    LOG.warn("pre-freeze hook failed for {}: {}", type, e.getMessage());
+                }
+            }
+        }
         module(type).freeze(frozen);
+    }
+
+    /** 注册冻结前钩子（null 清除；典型：复制器 backlog 排空屏障）。 */
+    public void setFreezeHook(CapabilityType type, Runnable hook) {
+        if (hook == null) {
+            freezeHooks.remove(type);
+        } else {
+            freezeHooks.put(type, hook);
+        }
     }
 
     /**

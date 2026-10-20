@@ -15,7 +15,7 @@ class LogBusTest {
 
     private static LogRecord record(String level, String logger, String message,
                                     String node, String stack) {
-        return new LogRecord(level, logger, "thread-1", message, stack, node,
+        return new LogRecord(null, level, logger, "thread-1", message, stack, node,
                 System.currentTimeMillis());
     }
 

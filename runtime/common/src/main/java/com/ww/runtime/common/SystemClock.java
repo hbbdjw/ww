@@ -18,4 +18,9 @@ public final class SystemClock implements Clock {
     public long nowMillis() {
         return System.currentTimeMillis();
     }
+
+    @Override
+    public long monotonicMillis() {
+        return System.nanoTime() / 1_000_000L;
+    }
 }

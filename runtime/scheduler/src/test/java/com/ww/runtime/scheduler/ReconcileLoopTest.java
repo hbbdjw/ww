@@ -120,9 +120,47 @@ class ReconcileLoopTest {
         assertThat(status.primariesByCapability().get(MOCK.name())).hasSize(PARTITIONS);
     }
 
+    /** 全禁用（desired 全 DISABLED）：排空停止节点且<b>清空放置表</b>——残留 owner 指向已停节点会导致读写 503 与再启用迁移风暴。 */
+    @Test
+    void disablingAllNodesStopsCapabilityAndClearsPlacementRing() {
+        activate(A);
+        activate(B);
+        assertThat(loop.runOnce()).isTrue();
+        assertThat(placements.primaries(MOCK.name())).hasSize(PARTITIONS);
+
+        // 第一轮：禁 A（B 仍 desired-ACTIVE）→ A 的分区正常迁移给 B 后停止
+        writer.setDesired(A, MOCK, CapabilityState.DISABLED);
+        assertThat(loop.runOnce()).isTrue();
+        assertThat(capabilities.get(A, MOCK)).map(CapabilityRecord::actual)
+                .contains(CapabilityState.DISABLED);
+        assertThat(migration.recorded).isNotEmpty();
+        assertThat(migration.recorded)
+                .allSatisfy(move -> assertThat(move.from()).isEqualTo(A));
+
+        // 第二轮：排空最后节点 B（desiredAlive 空）→ 无处可迁不产生迁移，直接停止
+        int migrationsBeforeLastDrain = migration.recorded.size();
+        writer.setDesired(B, MOCK, CapabilityState.DISABLED);
+        assertThat(loop.runOnce()).isTrue();
+        assertThat(commands.stopped()).containsExactlyInAnyOrder(A.value(), B.value());
+        assertThat(capabilities.get(B, MOCK)).map(CapabilityRecord::actual)
+                .contains(CapabilityState.DISABLED);
+        assertThat(migration.recorded).hasSize(migrationsBeforeLastDrain); // 最后一步无新迁移
+
+        // 放置表清空：owner 不再指向已停节点；再启用走引导路径重建环
+        assertThat(placements.primaries(MOCK.name())).isEmpty();
+        assertThat(placements.list(MOCK.name())).isEmpty();
+
+        // 再启用 A：引导重建（而非基于残留环规划 from=已停能力的迁移）
+        activate(A);
+        assertThat(loop.runOnce()).isTrue();
+        Map<Integer, NodeId> rebuilt = placements.primaries(MOCK.name());
+        assertThat(rebuilt).hasSize(PARTITIONS);
+        assertThat(rebuilt.values()).allMatch(A::equals);
+        assertThat(migration.recorded).hasSize(migrationsBeforeLastDrain); // 引导 replaceAll，不产生迁移任务
+    }
+
     @Test
     void r5DisablingNodeMigratesOnlyItsPartitionsAway() {
-        // 前置：MOCK 在 A/B 为 ACTIVE；C 已 desired-ACTIVE 未上线；placement 已建（环 = {A,B}）
         activate(A);
         activate(B);
         writer.setDesired(C, MOCK, CapabilityState.ACTIVE);
@@ -172,6 +210,121 @@ class ReconcileLoopTest {
                 assertThat(after.get(partition)).as("partition %d", partition).isEqualTo(owner);
             }
         });
+    }
+
+    /**
+     * STORAGE（rf=2）：引导放置含 PRIMARY+REPLICA 行；禁用节点 B 后其主分区经
+     * <b>副本提升</b>排空（结构性场景：2 节点环中排空目标必为副本持有者，走迁移 +
+     * cutover 会违反放置主键）、节点停止、actual=DISABLED，全程零迁移任务。
+     */
+    @Test
+    void storageBootstrapsReplicasAndMigratesOnDisable() {
+        CapabilityType storage = CapabilityType.STORAGE;
+        ReconcileLoop storageLoop = new ReconcileLoop(SCHEDULER, lease, registry, capabilities,
+                placements, engine, new RebalancePlanner(), commands, migration,
+                SchedulerConfig.of(5_000L, 1_000L, 500L, PARTITIONS, 2, 1, 0.10d, COOLDOWN_MS),
+                clock);
+        writer.setDesired(A, storage, CapabilityState.ACTIVE);
+        capabilities.setActual(A, storage, CapabilityState.ACTIVE);
+        writer.setDesired(B, storage, CapabilityState.ACTIVE);
+        capabilities.setActual(B, storage, CapabilityState.ACTIVE);
+
+        assertThat(storageLoop.runOnce()).isTrue();
+
+        // 引导放置：每分区 PRIMARY + REPLICA 两行，副本异节点分布
+        List<Placement> rows = placements.list(storage.name());
+        assertThat(rows).hasSize(PARTITIONS * 2);
+        Map<Integer, List<Placement>> byPartition = rows.stream()
+                .collect(Collectors.groupingBy(Placement::partition));
+        assertThat(byPartition).hasSize(PARTITIONS);
+        byPartition.forEach((partition, partRows) -> {
+            assertThat(partRows).hasSize(2);
+            assertThat(partRows.get(0).isPrimary()).isTrue();
+            assertThat(partRows.get(1).isPrimary()).isFalse();
+            assertThat(partRows.get(0).node()).isNotEqualTo(partRows.get(1).node());
+        });
+
+        Map<Integer, NodeId> before = placements.primaries(storage.name());
+        Set<Integer> partitionsOfB = before.entrySet().stream()
+                .filter(entry -> entry.getValue().equals(B))
+                .map(Map.Entry::getKey)
+                .collect(Collectors.toSet());
+        assertThat(partitionsOfB).isNotEmpty();
+
+        // 管理面：禁用 B → 其主分区副本提升排空后停止（目标 A 必持有副本，零迁移任务）
+        writer.setDesired(B, storage, CapabilityState.DISABLED);
+        assertThat(storageLoop.runOnce()).isTrue();
+
+        assertThat(migration.recorded)
+                .as("2 节点环排空目标即副本持有者，应全部提升完成，不产生迁移任务")
+                .isEmpty();
+
+        assertThat(capabilities.get(B, storage)).map(CapabilityRecord::actual)
+                .contains(CapabilityState.DISABLED);
+        assertThat(commands.stopped()).containsExactly(B.value());
+        assertThat(commands.freezes()).containsSubsequence("freeze:" + B.value() + ":true",
+                "freeze:" + B.value() + ":false");
+
+        Map<Integer, NodeId> after = placements.primaries(storage.name());
+        assertThat(after).hasSize(PARTITIONS);
+        assertThat(after.values()).noneMatch(B::equals);
+        before.forEach((partition, owner) -> {
+            if (!owner.equals(B)) {
+                assertThat(after.get(partition)).as("partition %d", partition).isEqualTo(owner);
+            }
+        });
+    }
+
+    /**
+     * 副本集补足：模拟 promote 消耗副本行后无人重建的泄漏（分区只剩 PRIMARY 行）。
+     * 主环已收敛时，冷却期内不动作；冷却期过后的周期把缺失副本行重建到目标环节点。
+     */
+    @Test
+    void replicaTopUpRestoresMissingReplicaRowsAfterConvergence() {
+        CapabilityType storage = CapabilityType.STORAGE;
+        ReconcileLoop storageLoop = new ReconcileLoop(SCHEDULER, lease, registry, capabilities,
+                placements, engine, new RebalancePlanner(), commands, migration,
+                SchedulerConfig.of(5_000L, 1_000L, 500L, PARTITIONS, 2, 1, 0.10d, COOLDOWN_MS),
+                clock);
+        for (NodeId node : List.of(A, B, C)) {
+            writer.setDesired(node, storage, CapabilityState.ACTIVE);
+            capabilities.setActual(node, storage, CapabilityState.ACTIVE);
+        }
+
+        // 引导：每分区 PRIMARY + REPLICA 两行（此周期同时记录补足节流时间戳）
+        assertThat(storageLoop.runOnce()).isTrue();
+        assertThat(placements.list(storage.name())).hasSize(PARTITIONS * 2);
+
+        // 模拟 promote 泄漏：删掉一个分区的全部副本行，只剩主行
+        int victim = placements.primaries(storage.name()).keySet().iterator().next();
+        placements.reassignReplicas(storage.name(), victim, List.of());
+        assertThat(placements.list(storage.name())).hasSize(PARTITIONS * 2 - 1);
+
+        // 冷却期内：补足不执行
+        assertThat(storageLoop.runOnce()).isTrue();
+        assertThat(placements.list(storage.name())).hasSize(PARTITIONS * 2 - 1);
+
+        // 冷却期过后：缺失副本行重建（主不动，副本落在异节点）
+        clock.advance(COOLDOWN_MS + 1);
+        assertThat(storageLoop.runOnce()).isTrue();
+
+        List<Placement> all = placements.list(storage.name());
+        assertThat(all).hasSize(PARTITIONS * 2);
+        List<Placement> victimRows = all.stream()
+                .filter(p -> p.partition() == victim)
+                .toList();
+        assertThat(victimRows).hasSize(2);
+        assertThat(victimRows.stream().filter(Placement::isPrimary).count()).isEqualTo(1);
+        Placement replica = victimRows.stream()
+                .filter(p -> !p.isPrimary())
+                .findFirst()
+                .orElseThrow();
+        NodeId primaryNode = victimRows.stream()
+                .filter(Placement::isPrimary)
+                .map(Placement::node)
+                .findFirst()
+                .orElseThrow();
+        assertThat(replica.node()).isNotEqualTo(primaryNode);
     }
 
     @Test

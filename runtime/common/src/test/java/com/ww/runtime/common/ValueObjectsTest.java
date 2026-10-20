@@ -99,13 +99,19 @@ class ValueObjectsTest {
 
     @Test
     void nodeInfoOfCreatesEqualValues() {
-        NodeInfo a = NodeInfo.of(NodeId.of("n1"), "host-1", 9090, NodeState.ACTIVE,
+        // 7 参工厂 httpPort 默认 0
+        NodeInfo legacy = NodeInfo.of(NodeId.of("n1"), "host-1", 9090, NodeState.ACTIVE,
                 5L, 1.5, sampleSnapshot());
-        NodeInfo b = new NodeInfo(NodeId.of("n1"), "host-1", 9090, NodeState.ACTIVE,
+        assertThat(legacy.httpPort()).isZero();
+
+        NodeInfo a = NodeInfo.of(NodeId.of("n1"), "host-1", 9090, 8080, NodeState.ACTIVE,
+                5L, 1.5, sampleSnapshot());
+        NodeInfo b = new NodeInfo(NodeId.of("n1"), "host-1", 9090, 8080, NodeState.ACTIVE,
                 5L, 1.5, sampleSnapshot());
         assertThat(a).isEqualTo(b);
         assertThat(a.id()).isEqualTo(NodeId.of("n1"));
         assertThat(a.state()).isEqualTo(NodeState.ACTIVE);
+        assertThat(a.httpPort()).isEqualTo(8080);
     }
 
     @Test

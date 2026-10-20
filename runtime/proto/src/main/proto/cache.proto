@@ -1,0 +1,95 @@
+syntax = "proto3";
+
+package runtime.v1;
+
+option java_package = "com.ww.runtime.proto";
+option java_multiple_files = true;
+
+// CACHE 网关转发写：value 为 Codec 编码字节（与迁移通道同信任边界）。
+// ttl_millis：>0 相对过期毫秒；<=0 永不过期。
+message CachePutReqP {
+  string key = 1;
+  bytes value = 2;
+  int64 ttl_millis = 3;
+}
+
+message CachePutAckP {
+  bool ok = 1;
+  string message = 2;   // fencing 拒绝等错误说明（ok=false 时）
+}
+
+// 网关转发“不存在才写”应答：applied=false 表示 key 已存在（未写入）。
+message CachePutIfAbsentAckP {
+  bool ok = 1;
+  bool applied = 2;
+  string message = 3;   // fencing 拒绝等错误说明（ok=false 时）
+}
+
+message CacheGetReqP {
+  string key = 1;
+}
+
+// 属主端读应答：exists=false 表达 key 不存在；ttl_millis 为剩余过期毫秒
+//（<=0 表示永不过期）。
+message CacheValueP {
+  bool exists = 1;
+  bytes value = 2;
+  int64 ttl_millis = 3;
+}
+
+message CacheDeleteReqP {
+  string key = 1;
+}
+
+message CacheDeleteAckP {
+  bool ok = 1;
+  bool deleted = 2;     // key 原本存在并已删除
+  string message = 3;   // fencing 拒绝等错误说明（ok=false 时）
+}
+
+// 管理面 key 列举（fan-out 聚合用）：prefix 空串表示不过滤；limit<=0 由服务端钳制上限。
+message CacheListKeysReqP {
+  string prefix = 1;
+  int32 limit = 2;
+}
+
+message CacheKeyEntryP {
+  string key = 1;
+  int64 ttl_millis = 2;   // <=0 永不过期
+}
+
+message CacheCountReqP {
+  string prefix = 1;
+}
+
+message CacheCountAckP {
+  int64 count = 1;
+}
+
+// 统一命令通道：payload = Codec 编码的 List<Object> 参数（空字节表示无参数）；
+// 应答 payload = Codec 编码的结果；语义错误通过 ok=false + code 返回。
+message CacheCommandReqP {
+  string command = 1;
+  bytes payload = 2;
+}
+
+message CacheCommandAckP {
+  bool ok = 1;
+  bytes payload = 2;
+  string code = 3;
+  string message = 4;
+}
+
+// CACHE 数据面：网关转发（属主节点执行 fencing 写/删）。
+// 挂载于 GrpcServerHost，plaintext 内网（与 Storage/Migration 同信任边界）。
+service Cache {
+  rpc ForwardPut(CachePutReqP) returns (CachePutAckP);
+  rpc ForwardPutIfAbsent(CachePutReqP) returns (CachePutIfAbsentAckP);
+  rpc ForwardGet(CacheGetReqP) returns (CacheValueP);
+  rpc ForwardDelete(CacheDeleteReqP) returns (CacheDeleteAckP);
+  // 统一命令通道（Hash/List/Set/ZSet/Stream/Keyspace 与 STATS/SCAN）
+  rpc ExecuteCommand(CacheCommandReqP) returns (CacheCommandAckP);
+  // 管理面：本节点 key 列举（server 流）与前缀计数（fan-out 聚合用，不做 fencing）
+  rpc ListKeys(CacheListKeysReqP) returns (stream CacheKeyEntryP);
+  rpc CountKeys(CacheCountReqP) returns (CacheCountAckP);
+}

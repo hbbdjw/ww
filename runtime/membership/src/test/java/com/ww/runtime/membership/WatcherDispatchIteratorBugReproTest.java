@@ -27,23 +27,15 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * 缺陷复现：{@code MembershipService.dispatch} 在 CopyOnWriteArrayList 的快照迭代器上
- * 调用 {@code it.remove()}——COW 迭代器不支持 remove，必抛 {@link UnsupportedOperationException}。
+ * 验证 {@code MembershipService.dispatch} 中单个坏 watcher 不影响其他 watcher 的事件分发。
  *
- * <p>两条触发路径命中同一缺陷：</p>
- * <ul>
- *   <li>watcher 被取消（{@code isCancelled()==true}）→ try 块内 {@code it.remove()} 抛异常
- *       → 落入 catch → catch 内再次 {@code it.remove()} 二次抛异常并逃逸分发任务；</li>
- *   <li>{@code watcher.onNext} 抛 RuntimeException（传输层在 isCancelled 检查与 onNext 之间
- *       关闭流，或流已死但未标记取消）→ catch 内 {@code it.remove()} 抛异常逃逸。</li>
- * </ul>
+ * <p>watchers 列表为 CopyOnWriteArrayList，其快照迭代器不支持 {@code remove()}，
+ * 失效 watcher 必须在遍历中收集、循环结束后按值统一移除，
+ * 以保证分发循环不被异常中断且坏 watcher 可被移除。</p>
  *
- * <p>后果：坏 watcher 永远无法从列表移除，每次分发都在它身上中断——
- * 列表中<b>其后注册</b>的全部 watcher 从此收不到任何事件（静默丢失）。</p>
- *
- * <p>真实触发路径是竞态（客户端取消与 dispatch 快照并发），本测试以确定性方式
- * 复现同一代码路径：向 watchers 列表注入一个 onNext 抛 StatusRuntimeException 的
- * 坏流观察者（位于真实 watcher 之前），然后验证后续 watcher 的事件送达。</p>
+ * <p>测试向 watchers 列表注入一个 onNext 抛 StatusRuntimeException 的坏流观察者
+ * （位于真实 watcher 之前，模拟客户端取消或传输关闭导致的死流），
+ * 然后验证其后注册的 watcher 能完整收到事件。</p>
  */
 class WatcherDispatchIteratorBugReproTest {
 
@@ -138,16 +130,14 @@ class WatcherDispatchIteratorBugReproTest {
         service.addListener(event -> listenerEvents.incrementAndGet());
 
         // 确认坏 watcher 位于列表头部、真实 watcher2 在其后（迭代顺序 = 列表顺序）
-        // watch RPC 注册是异步的：轮询列表直到 watcher2 落入（不能用事件探测，
-        // 因为坏 watcher 在列表头部会拦截一切事件——这本身就是待复现的缺陷）
+        // watch RPC 注册是异步的：轮询列表直到 watcher2 落入
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
         while (watchers.size() < 2 && System.nanoTime() < deadline) {
             Thread.sleep(20L);
         }
         assertThat(watchers).hasSizeGreaterThan(1);
 
-        // 连续两个事件：dispatch 遍历到坏 watcher → onNext 抛异常 → catch 内
-        // it.remove() 抛 UnsupportedOperationException 逃逸分发任务 → watcher2 静默丢失
+        // 连续两个事件：坏 watcher 的 onNext 异常不得中断分发任务，两个事件均应送达 watcher2
         service.merge(info("Y", 9002), false);
         Thread.sleep(300L);
         service.merge(info("Z", 9003), false);

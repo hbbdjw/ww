@@ -87,7 +87,7 @@ public class DbLogAppender extends AppenderBase<ILoggingEvent> {
                 stackTrace = truncate(ThrowableProxyUtil.asString(event.getThrowableProxy()), MAX_STACK_LENGTH);
             }
             LogRecord record = new LogRecord(
-                    level, loggerName, threadName, message, stackTrace, nodeKey, event.getTimeStamp());
+                    null, level, loggerName, threadName, message, stackTrace, nodeKey, event.getTimeStamp());
             LogBuffer.offer(record);
         } catch (Exception e) {
             // 采集失败绝不能影响业务线程与日志主链路

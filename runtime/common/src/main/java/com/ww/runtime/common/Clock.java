@@ -6,4 +6,12 @@ package com.ww.runtime.common;
 public interface Clock {
 
     long nowMillis();
+
+    /**
+     * 单调时间（毫秒）：不受 NTP 步进/回拨影响，用于租约到期等必须抵御墙钟跳变的判定。
+     * 默认退化为墙钟以保持测试时钟（TestClock）的确定性语义。
+     */
+    default long monotonicMillis() {
+        return nowMillis();
+    }
 }

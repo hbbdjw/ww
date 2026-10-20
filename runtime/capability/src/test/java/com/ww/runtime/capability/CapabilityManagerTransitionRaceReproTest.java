@@ -15,15 +15,13 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * 缺陷复现：{@code CapabilityManager.transition} 的「读状态 → 校验合法 → 写状态」
- * 是非原子的 check-then-act，且类上无任何同步。
+ * 验证 {@code CapabilityManager.start} 的并发语义：命令来源天然多线程
+ * （ClusterControlServer 运行在 gRPC 线程池上，调度器重试、双 leader 重叠窗口、
+ * 人工运维命令可并发到达同一节点）。「锁外预读 + 锁内复核」保证两个并发 start
+ * 同时读到 DISABLED 时，仅一方执行模块钩子（start()/warm() 各一次），
+ * 另一方以非法跃迁被拒，状态最终收敛 ACTIVE。
  *
- * <p>命令来源天然多线程：ClusterControlServer 运行在 gRPC 线程池上（调度器重试、
- * 双 leader 重叠窗口、人工运维命令可并发到达同一节点）。两个并发 start 可同时读到
- * DISABLED、同时通过合法性校验、双双写入 STARTING 并<b>重复执行模块钩子</b>
- * （start()/warm() 各两次）——重量级模块（建连接、回放日志）会被重复初始化。</p>
- *
- * <p>本测试用门闩仓库把两个线程同时钉在「读状态」一刻，确定性复现交织。</p>
+ * <p>门闩仓库把两个线程同时钉在「读状态」一刻，确定性构造该交织。</p>
  */
 class CapabilityManagerTransitionRaceReproTest {
 
@@ -100,6 +98,11 @@ class CapabilityManagerTransitionRaceReproTest {
         @Override
         public List<CapabilityRecord> list() {
             return delegate.list();
+        }
+
+        @Override
+        public void delete(NodeId node) {
+            delegate.delete(node);
         }
     }
 

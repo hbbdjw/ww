@@ -7,14 +7,20 @@ import "cluster.proto";
 option java_package = "com.ww.runtime.proto";
 option java_multiple_files = true;
 
-// 成员心跳请求：携带自描述节点信息
+// 成员心跳请求：携带自描述节点信息 + 请求方已知的对端视图版本
 message HeartbeatReq {
   NodeInfoP self = 1;
+  // S1②：请求方上次从本对端收到的视图版本号（首次/未知传 -1）。
+  // 应答方据此判断请求方视图是否落后，决定是否回传全量成员。
+  int64 known_ack_version = 2;
 }
 
-// 成员心跳应答：当前全量成员视图
+// 成员心跳应答：当前全量成员视图 + 应答方视图版本
 message HeartbeatAck {
   repeated NodeInfoP members = 1;
+  // S1②：本次应答对应的应答方视图版本号。
+  // members 为空表示应答方视图相对请求方 known_ack_version 无变化（增量确认，省 O(N²) 全量带宽）。
+  int64 ack_version = 2;
 }
 
 message WatchReq {

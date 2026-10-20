@@ -2,7 +2,7 @@
 <jmeterTestPlan version="1.2" properties="5.0" jmeter="5.6.3">
   <hashTree>
     <TestPlan guiclass="TestPlanGui" testclass="TestPlan" testname="ww storage 分布式对象存储压测">
-      <stringProp name="TestPlan.comments">ww 项目 storage 模块压测脚本：清空存储数据 → 施压（桶/上传/下载/查询/删除）→ 结果验证（文件数比对 + 随机下载已上传文件）。</stringProp>
+      <stringProp name="TestPlan.comments">ww 项目 runtime-server STORAGE 网关压测脚本：清空存储数据 → 施压（桶/上传/下载/查询/删除）→ 结果验证（list 翻页计数比对 + 随机下载已上传文件）。无认证，任意节点可打，网关按 placement 自动路由。</stringProp>
       <boolProp name="TestPlan.serialize_threadgroups">true</boolProp>
       <boolProp name="TestPlan.tearDown_on_shutdown">true</boolProp>
       <elementProp name="TestPlan.user_defined_variables" elementType="Arguments" guiclass="ArgumentsPanel" testclass="Arguments" testname="用户定义的变量">
@@ -35,16 +35,6 @@
           <elementProp name="NODE3_PORT" elementType="Argument">
             <stringProp name="Argument.name">NODE3_PORT</stringProp>
             <stringProp name="Argument.value">8083</stringProp>
-            <stringProp name="Argument.metadata">=</stringProp>
-          </elementProp>
-          <elementProp name="USERNAME" elementType="Argument">
-            <stringProp name="Argument.name">USERNAME</stringProp>
-            <stringProp name="Argument.value">admin</stringProp>
-            <stringProp name="Argument.metadata">=</stringProp>
-          </elementProp>
-          <elementProp name="PASSWORD" elementType="Argument">
-            <stringProp name="Argument.name">PASSWORD</stringProp>
-            <stringProp name="Argument.value">admin123</stringProp>
             <stringProp name="Argument.metadata">=</stringProp>
           </elementProp>
           <elementProp name="BUCKET" elementType="Argument">
@@ -107,15 +97,6 @@
       <boolProp name="TestPlan.functional_mode">false</boolProp>
     </TestPlan>
     <hashTree>
-      <HeaderManager guiclass="HeaderPanel" testclass="HeaderManager" testname="全局请求头：Bearer 认证">
-        <collectionProp name="HeaderManager.headers">
-          <elementProp name="" elementType="Header">
-            <stringProp name="Header.name">Authorization</stringProp>
-            <stringProp name="Header.value">Bearer ${__P(TOKEN,)}</stringProp>
-          </elementProp>
-        </collectionProp>
-      </HeaderManager>
-      <hashTree/>
       <CSVDataSet guiclass="TestBeanGUI" testclass="CSVDataSet" testname="多节点轮询数据源（nodes.csv）" enabled="true">
         <stringProp name="delimiter">,</stringProp>
         <stringProp name="fileEncoding">UTF-8</stringProp>
@@ -128,7 +109,7 @@
         <stringProp name="variableNames">NODE_HOST,NODE_PORT</stringProp>
       </CSVDataSet>
       <hashTree/>
-      <SetupThreadGroup guiclass="SetupThreadGroupGui" testclass="SetupThreadGroup" testname="setUp-登录与清空存储数据" enabled="true">
+      <SetupThreadGroup guiclass="SetupThreadGroupGui" testclass="SetupThreadGroup" testname="setUp-清空存储数据" enabled="true">
         <intProp name="ThreadGroup.num_threads">1</intProp>
         <intProp name="ThreadGroup.ramp_time">1</intProp>
         <boolProp name="ThreadGroup.same_user_on_next_iteration">true</boolProp>
@@ -139,69 +120,6 @@
         </elementProp>
       </SetupThreadGroup>
       <hashTree>
-        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="登录 /auth/login（获取 Bearer Token）" enabled="true">
-          <intProp name="HTTPSampler.connect_timeout">10000</intProp>
-          <intProp name="HTTPSampler.response_timeout">10000</intProp>
-          <stringProp name="HTTPSampler.domain">${NODE1_HOST}</stringProp>
-          <stringProp name="HTTPSampler.port">${NODE1_PORT}</stringProp>
-          <stringProp name="HTTPSampler.protocol">http</stringProp>
-          <stringProp name="HTTPSampler.contentEncoding">UTF-8</stringProp>
-          <stringProp name="HTTPSampler.path">/auth/login</stringProp>
-          <boolProp name="HTTPSampler.follow_redirects">true</boolProp>
-          <stringProp name="HTTPSampler.method">POST</stringProp>
-          <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
-          <boolProp name="HTTPSampler.postBodyRaw">true</boolProp>
-          <elementProp name="HTTPsampler.Arguments" elementType="Arguments">
-            <collectionProp name="Arguments.arguments">
-              <elementProp name="" elementType="HTTPArgument">
-                <boolProp name="HTTPArgument.always_encode">false</boolProp>
-                <stringProp name="Argument.value">{&quot;username&quot;:&quot;${USERNAME}&quot;,&quot;password&quot;:&quot;${PASSWORD}&quot;}</stringProp>
-                <stringProp name="Argument.metadata">=</stringProp>
-              </elementProp>
-            </collectionProp>
-          </elementProp>
-          <stringProp name="HTTPSampler.implementation">HttpClient4</stringProp>
-        </HTTPSamplerProxy>
-        <hashTree>
-          <HeaderManager guiclass="HeaderPanel" testclass="HeaderManager" testname="登录请求头 Content-Type" enabled="true">
-            <collectionProp name="HeaderManager.headers">
-              <elementProp name="" elementType="Header">
-                <stringProp name="Header.name">Content-Type</stringProp>
-                <stringProp name="Header.value">application/json</stringProp>
-              </elementProp>
-            </collectionProp>
-          </HeaderManager>
-          <hashTree/>
-          <JSR223Assertion guiclass="TestBeanGUI" testclass="JSR223Assertion" testname="登录成功断言（type=success）" enabled="true">
-            <stringProp name="cacheKey">true</stringProp>
-            <stringProp name="filename"></stringProp>
-            <stringProp name="parameters"></stringProp>
-            <stringProp name="script">def body = SampleResult.getResponseDataAsString()
-if (body == null || !body.contains(&apos;&quot;type&quot;:&quot;success&quot;&apos;)) {
-    AssertionResult.setFailure(true)
-    AssertionResult.setFailureMessage(&apos;响应未包含 type=success: &apos; + body)
-}</stringProp>
-            <stringProp name="scriptLanguage">groovy</stringProp>
-          </JSR223Assertion>
-          <hashTree/>
-          <JSR223PostProcessor guiclass="TestBeanGUI" testclass="JSR223PostProcessor" testname="提取 accessToken 写入 props" enabled="true">
-            <stringProp name="cacheKey">true</stringProp>
-            <stringProp name="filename"></stringProp>
-            <stringProp name="parameters"></stringProp>
-            <stringProp name="script">import groovy.json.JsonSlurper
-def resp = prev.getResponseDataAsString()
-def json = new JsonSlurper().parseText(resp)
-def token = json?.data?.accessToken
-if (token) {
-    props.put(&quot;TOKEN&quot;, token)
-    log.info(&quot;登录成功，accessToken 已写入 props，长度=&quot; + token.length())
-} else {
-    log.error(&quot;登录失败，未获取到 accessToken，响应=&quot; + resp)
-}</stringProp>
-            <stringProp name="scriptLanguage">groovy</stringProp>
-          </JSR223PostProcessor>
-          <hashTree/>
-        </hashTree>
         <LoopController guiclass="LoopControlPanel" testclass="LoopController" testname="删除所有测试桶循环（BUCKET_COUNT 次）" enabled="true">
           <boolProp name="LoopController.continue_forever">false</boolProp>
           <stringProp name="LoopController.loops">${BUCKET_COUNT}</stringProp>
@@ -223,7 +141,7 @@ if (token) {
             <stringProp name="HTTPSampler.port">${NODE1_PORT}</stringProp>
             <stringProp name="HTTPSampler.protocol">http</stringProp>
             <stringProp name="HTTPSampler.contentEncoding">UTF-8</stringProp>
-            <stringProp name="HTTPSampler.path">/storage/buckets/${BUCKET}_${DEL_B_IDX}?recursive=true</stringProp>
+            <stringProp name="HTTPSampler.path">/storage/${BUCKET}_${DEL_B_IDX}?recursive=true</stringProp>
             <boolProp name="HTTPSampler.follow_redirects">true</boolProp>
             <stringProp name="HTTPSampler.method">DELETE</stringProp>
             <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
@@ -234,15 +152,17 @@ if (token) {
             <stringProp name="HTTPSampler.implementation">HttpClient4</stringProp>
           </HTTPSamplerProxy>
           <hashTree>
-            <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="断言 HTTP 200（服务可达）" enabled="true">
-              <collectionProp name="Asserion.test_strings">
-                <stringProp name="49586">200</stringProp>
-              </collectionProp>
-              <stringProp name="Assertion.custom_message"></stringProp>
-              <stringProp name="Assertion.test_field">Assertion.response_code</stringProp>
-              <boolProp name="Assertion.assume_success">false</boolProp>
-              <intProp name="Assertion.test_type">8</intProp>
-            </ResponseAssertion>
+            <JSR223Assertion guiclass="TestBeanGUI" testclass="JSR223Assertion" testname="断言 204/409（删除成功或桶不存在）" enabled="true">
+              <stringProp name="cacheKey">true</stringProp>
+              <stringProp name="filename"></stringProp>
+              <stringProp name="parameters"></stringProp>
+              <stringProp name="script">def code = SampleResult.getResponseCode()
+if (code != &apos;204&apos; &amp;&amp; code != &apos;409&apos;) {
+    AssertionResult.setFailure(true)
+    AssertionResult.setFailureMessage(&apos;期望 204(删除)/409(不存在)，实际 &apos; + code + &apos;: &apos; + SampleResult.getResponseDataAsString())
+}</stringProp>
+              <stringProp name="scriptLanguage">groovy</stringProp>
+            </JSR223Assertion>
             <hashTree/>
           </hashTree>
         </hashTree>
@@ -264,14 +184,14 @@ if (token) {
             <boolProp name="CounterConfig.per_user">false</boolProp>
           </CounterConfig>
           <hashTree/>
-          <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="创建测试桶 PUT /storage/buckets/${BUCKET}_${CREATE_B_IDX}" enabled="true">
+          <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="创建测试桶 PUT /storage/${BUCKET}_${CREATE_B_IDX}" enabled="true">
             <intProp name="HTTPSampler.connect_timeout">10000</intProp>
             <intProp name="HTTPSampler.response_timeout">10000</intProp>
             <stringProp name="HTTPSampler.domain">${NODE1_HOST}</stringProp>
             <stringProp name="HTTPSampler.port">${NODE1_PORT}</stringProp>
             <stringProp name="HTTPSampler.protocol">http</stringProp>
             <stringProp name="HTTPSampler.contentEncoding">UTF-8</stringProp>
-            <stringProp name="HTTPSampler.path">/storage/buckets/${BUCKET}_${CREATE_B_IDX}</stringProp>
+            <stringProp name="HTTPSampler.path">/storage/${BUCKET}_${CREATE_B_IDX}</stringProp>
             <boolProp name="HTTPSampler.follow_redirects">true</boolProp>
             <stringProp name="HTTPSampler.method">PUT</stringProp>
             <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
@@ -282,14 +202,14 @@ if (token) {
             <stringProp name="HTTPSampler.implementation">HttpClient4</stringProp>
           </HTTPSamplerProxy>
           <hashTree>
-            <JSR223Assertion guiclass="TestBeanGUI" testclass="JSR223Assertion" testname="建桶成功断言（type=success）" enabled="true">
+            <JSR223Assertion guiclass="TestBeanGUI" testclass="JSR223Assertion" testname="建桶成功断言（created=true）" enabled="true">
               <stringProp name="cacheKey">true</stringProp>
               <stringProp name="filename"></stringProp>
               <stringProp name="parameters"></stringProp>
               <stringProp name="script">def body = SampleResult.getResponseDataAsString()
-if (body == null || !body.contains(&apos;&quot;type&quot;:&quot;success&quot;&apos;)) {
+if (body == null || !body.contains(&apos;&quot;created&quot;:true&apos;)) {
     AssertionResult.setFailure(true)
-    AssertionResult.setFailureMessage(&apos;响应未包含 type=success: &apos; + body)
+    AssertionResult.setFailureMessage(&apos;响应未包含 created=true: &apos; + body)
 }</stringProp>
               <stringProp name="scriptLanguage">groovy</stringProp>
             </JSR223Assertion>
@@ -339,14 +259,14 @@ vars.put(&quot;UPLOAD_BUCKET&quot;, vars.get(&quot;BUCKET&quot;) + &quot;_&quot;
             <stringProp name="scriptLanguage">groovy</stringProp>
           </JSR223PreProcessor>
           <hashTree/>
-          <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="上传 PUT /storage/buckets/${UPLOAD_BUCKET}/objects/${UPLOAD_SEQ}.jpg" enabled="true">
+          <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="上传 PUT /storage/${UPLOAD_BUCKET}/${UPLOAD_SEQ}.jpg" enabled="true">
             <intProp name="HTTPSampler.connect_timeout">10000</intProp>
             <intProp name="HTTPSampler.response_timeout">10000</intProp>
             <stringProp name="HTTPSampler.domain">${NODE_HOST}</stringProp>
             <stringProp name="HTTPSampler.port">${NODE_PORT}</stringProp>
             <stringProp name="HTTPSampler.protocol">http</stringProp>
             <stringProp name="HTTPSampler.contentEncoding">ISO-8859-1</stringProp>
-            <stringProp name="HTTPSampler.path">/storage/buckets/${UPLOAD_BUCKET}/objects/${UPLOAD_SEQ}.jpg</stringProp>
+            <stringProp name="HTTPSampler.path">/storage/${UPLOAD_BUCKET}/${UPLOAD_SEQ}.jpg</stringProp>
             <boolProp name="HTTPSampler.follow_redirects">true</boolProp>
             <stringProp name="HTTPSampler.method">PUT</stringProp>
             <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
@@ -372,14 +292,14 @@ vars.put(&quot;UPLOAD_BUCKET&quot;, vars.get(&quot;BUCKET&quot;) + &quot;_&quot;
               </collectionProp>
             </HeaderManager>
             <hashTree/>
-            <JSR223Assertion guiclass="TestBeanGUI" testclass="JSR223Assertion" testname="上传成功断言（type=success）" enabled="true">
+            <JSR223Assertion guiclass="TestBeanGUI" testclass="JSR223Assertion" testname="上传成功断言（响应含 etag）" enabled="true">
               <stringProp name="cacheKey">true</stringProp>
               <stringProp name="filename"></stringProp>
               <stringProp name="parameters"></stringProp>
               <stringProp name="script">def body = SampleResult.getResponseDataAsString()
-if (body == null || !body.contains(&apos;&quot;type&quot;:&quot;success&quot;&apos;)) {
+if (body == null || !body.contains(&apos;&quot;etag&quot;:&apos;)) {
     AssertionResult.setFailure(true)
-    AssertionResult.setFailureMessage(&apos;响应未包含 type=success: &apos; + body)
+    AssertionResult.setFailureMessage(&apos;响应未包含 etag: &apos; + body)
 }</stringProp>
               <stringProp name="scriptLanguage">groovy</stringProp>
             </JSR223Assertion>
@@ -388,13 +308,10 @@ if (body == null || !body.contains(&apos;&quot;type&quot;:&quot;success&quot;&ap
               <stringProp name="cacheKey">true</stringProp>
               <stringProp name="filename"></stringProp>
               <stringProp name="parameters"></stringProp>
-              <stringProp name="script">if (prev.isSuccessful()) {
-    def body = prev.getResponseDataAsString()
-    if (body != null &amp;&amp; body.contains(&quot;\&quot;code\&quot;:\&quot;0\&quot;&quot;)) {
-        synchronized (props) {
-            def cur = (props.get(&quot;UPLOAD_OK&quot;) as Long) ?: 0L
-            props.put(&quot;UPLOAD_OK&quot;, cur + 1L)
-        }
+              <stringProp name="script">if (prev.isSuccessful() &amp;&amp; prev.getResponseCode() == &quot;200&quot;) {
+    synchronized (props) {
+        def cur = (props.get(&quot;UPLOAD_OK&quot;) as Long) ?: 0L
+        props.put(&quot;UPLOAD_OK&quot;, cur + 1L)
     }
 }</stringProp>
               <stringProp name="scriptLanguage">groovy</stringProp>
@@ -414,14 +331,14 @@ if (body == null || !body.contains(&apos;&quot;type&quot;:&quot;success&quot;&ap
         </elementProp>
       </ThreadGroup>
       <hashTree>
-        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="随机下载 GET /storage/buckets/${RAND_GET_BUCKET}/objects/${RAND_KEY_GET}.jpg" enabled="true">
+        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="随机下载 GET /storage/${RAND_GET_BUCKET}/${RAND_KEY_GET}.jpg" enabled="true">
           <intProp name="HTTPSampler.connect_timeout">10000</intProp>
           <intProp name="HTTPSampler.response_timeout">10000</intProp>
           <stringProp name="HTTPSampler.domain">${NODE_HOST}</stringProp>
           <stringProp name="HTTPSampler.port">${NODE_PORT}</stringProp>
           <stringProp name="HTTPSampler.protocol">http</stringProp>
           <stringProp name="HTTPSampler.contentEncoding">UTF-8</stringProp>
-          <stringProp name="HTTPSampler.path">/storage/buckets/${RAND_GET_BUCKET}/objects/${RAND_KEY_GET}.jpg</stringProp>
+          <stringProp name="HTTPSampler.path">/storage/${RAND_GET_BUCKET}/${RAND_KEY_GET}.jpg</stringProp>
           <boolProp name="HTTPSampler.follow_redirects">true</boolProp>
           <stringProp name="HTTPSampler.method">GET</stringProp>
           <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
@@ -464,7 +381,7 @@ vars.put(&quot;RAND_GET_BUCKET&quot;, vars.get(&quot;BUCKET&quot;) + &quot;_&quo
           <stringProp name="HTTPSampler.port">${NODE_PORT}</stringProp>
           <stringProp name="HTTPSampler.protocol">http</stringProp>
           <stringProp name="HTTPSampler.contentEncoding">UTF-8</stringProp>
-          <stringProp name="HTTPSampler.path">/storage/buckets/${RAND_HEAD_BUCKET}/objects/${RAND_KEY_HEAD}.jpg</stringProp>
+          <stringProp name="HTTPSampler.path">/storage/${RAND_HEAD_BUCKET}/${RAND_KEY_HEAD}.jpg</stringProp>
           <boolProp name="HTTPSampler.follow_redirects">true</boolProp>
           <stringProp name="HTTPSampler.method">HEAD</stringProp>
           <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
@@ -500,14 +417,14 @@ vars.put(&quot;RAND_HEAD_BUCKET&quot;, vars.get(&quot;BUCKET&quot;) + &quot;_&qu
           </ResponseAssertion>
           <hashTree/>
         </hashTree>
-        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="列举对象 GET .../objects?prefix=&amp;maxKeys=1000" enabled="true">
+        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="列举对象 GET /storage/${LIST_BUCKET}?prefix=&amp;maxKeys=1000" enabled="true">
           <intProp name="HTTPSampler.connect_timeout">10000</intProp>
           <intProp name="HTTPSampler.response_timeout">10000</intProp>
           <stringProp name="HTTPSampler.domain">${NODE_HOST}</stringProp>
           <stringProp name="HTTPSampler.port">${NODE_PORT}</stringProp>
           <stringProp name="HTTPSampler.protocol">http</stringProp>
           <stringProp name="HTTPSampler.contentEncoding">UTF-8</stringProp>
-          <stringProp name="HTTPSampler.path">/storage/buckets/${LIST_BUCKET}/objects?prefix=&amp;maxKeys=1000</stringProp>
+          <stringProp name="HTTPSampler.path">/storage/${LIST_BUCKET}?prefix=&amp;maxKeys=1000</stringProp>
           <boolProp name="HTTPSampler.follow_redirects">true</boolProp>
           <stringProp name="HTTPSampler.method">GET</stringProp>
           <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
@@ -528,17 +445,17 @@ vars.put(&quot;LIST_BUCKET&quot;, vars.get(&quot;BUCKET&quot;) + &quot;_&quot; +
             <stringProp name="scriptLanguage">groovy</stringProp>
           </JSR223PreProcessor>
           <hashTree/>
-          <JSR223Assertion guiclass="TestBeanGUI" testclass="JSR223Assertion" testname="列举成功断言（type=success）" enabled="true">
-            <stringProp name="cacheKey">true</stringProp>
-            <stringProp name="filename"></stringProp>
-            <stringProp name="parameters"></stringProp>
-            <stringProp name="script">def body = SampleResult.getResponseDataAsString()
-if (body == null || !body.contains(&apos;&quot;type&quot;:&quot;success&quot;&apos;)) {
+          <JSR223Assertion guiclass="TestBeanGUI" testclass="JSR223Assertion" testname="列举成功断言（响应含 objects）" enabled="true">
+              <stringProp name="cacheKey">true</stringProp>
+              <stringProp name="filename"></stringProp>
+              <stringProp name="parameters"></stringProp>
+              <stringProp name="script">def body = SampleResult.getResponseDataAsString()
+if (body == null || !body.contains(&apos;&quot;objects&quot;:&apos;)) {
     AssertionResult.setFailure(true)
-    AssertionResult.setFailureMessage(&apos;响应未包含 type=success: &apos; + body)
+    AssertionResult.setFailureMessage(&apos;响应未包含 objects: &apos; + body)
 }</stringProp>
-            <stringProp name="scriptLanguage">groovy</stringProp>
-          </JSR223Assertion>
+              <stringProp name="scriptLanguage">groovy</stringProp>
+            </JSR223Assertion>
           <hashTree/>
         </hashTree>
       </hashTree>
@@ -577,14 +494,14 @@ vars.put(&quot;DELETE_BUCKET&quot;, vars.get(&quot;BUCKET&quot;) + &quot;_&quot;
             <stringProp name="scriptLanguage">groovy</stringProp>
           </JSR223PreProcessor>
           <hashTree/>
-          <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="删除 DELETE /storage/buckets/${DELETE_BUCKET}/objects/${DELETE_SEQ}.jpg" enabled="true">
+          <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="删除 DELETE /storage/${DELETE_BUCKET}/${DELETE_SEQ}.jpg" enabled="true">
             <intProp name="HTTPSampler.connect_timeout">10000</intProp>
             <intProp name="HTTPSampler.response_timeout">10000</intProp>
             <stringProp name="HTTPSampler.domain">${NODE_HOST}</stringProp>
             <stringProp name="HTTPSampler.port">${NODE_PORT}</stringProp>
             <stringProp name="HTTPSampler.protocol">http</stringProp>
             <stringProp name="HTTPSampler.contentEncoding">UTF-8</stringProp>
-            <stringProp name="HTTPSampler.path">/storage/buckets/${DELETE_BUCKET}/objects/${DELETE_SEQ}.jpg</stringProp>
+            <stringProp name="HTTPSampler.path">/storage/${DELETE_BUCKET}/${DELETE_SEQ}.jpg</stringProp>
             <boolProp name="HTTPSampler.follow_redirects">true</boolProp>
             <stringProp name="HTTPSampler.method">DELETE</stringProp>
             <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
@@ -595,29 +512,24 @@ vars.put(&quot;DELETE_BUCKET&quot;, vars.get(&quot;BUCKET&quot;) + &quot;_&quot;
             <stringProp name="HTTPSampler.implementation">HttpClient4</stringProp>
           </HTTPSamplerProxy>
           <hashTree>
-            <JSR223Assertion guiclass="TestBeanGUI" testclass="JSR223Assertion" testname="删除成功断言（type=success）" enabled="true">
-              <stringProp name="cacheKey">true</stringProp>
-              <stringProp name="filename"></stringProp>
-              <stringProp name="parameters"></stringProp>
-              <stringProp name="script">def body = SampleResult.getResponseDataAsString()
-if (body == null || !body.contains(&apos;&quot;type&quot;:&quot;success&quot;&apos;)) {
-    AssertionResult.setFailure(true)
-    AssertionResult.setFailureMessage(&apos;响应未包含 type=success: &apos; + body)
-}</stringProp>
-              <stringProp name="scriptLanguage">groovy</stringProp>
-            </JSR223Assertion>
+            <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="删除成功断言 204" enabled="true">
+              <collectionProp name="Asserion.test_strings">
+                <stringProp name="49586">204</stringProp>
+              </collectionProp>
+              <stringProp name="Assertion.custom_message"></stringProp>
+              <stringProp name="Assertion.test_field">Assertion.response_code</stringProp>
+              <boolProp name="Assertion.assume_success">false</boolProp>
+              <intProp name="Assertion.test_type">8</intProp>
+            </ResponseAssertion>
             <hashTree/>
             <JSR223PostProcessor guiclass="TestBeanGUI" testclass="JSR223PostProcessor" testname="累计删除成功数 DELETE_OK" enabled="true">
               <stringProp name="cacheKey">true</stringProp>
               <stringProp name="filename"></stringProp>
               <stringProp name="parameters"></stringProp>
-              <stringProp name="script">if (prev.isSuccessful()) {
-    def body = prev.getResponseDataAsString()
-    if (body != null &amp;&amp; body.contains(&quot;\&quot;code\&quot;:\&quot;0\&quot;&quot;)) {
-        synchronized (props) {
-            def cur = (props.get(&quot;DELETE_OK&quot;) as Long) ?: 0L
-            props.put(&quot;DELETE_OK&quot;, cur + 1L)
-        }
+              <stringProp name="script">if (prev.isSuccessful() &amp;&amp; prev.getResponseCode() == &quot;204&quot;) {
+    synchronized (props) {
+        def cur = (props.get(&quot;DELETE_OK&quot;) as Long) ?: 0L
+        props.put(&quot;DELETE_OK&quot;, cur + 1L)
     }
 }</stringProp>
               <stringProp name="scriptLanguage">groovy</stringProp>
@@ -651,44 +563,46 @@ if (body == null || !body.contains(&apos;&quot;type&quot;:&quot;success&quot;&ap
             <boolProp name="CounterConfig.per_user">false</boolProp>
           </CounterConfig>
           <hashTree/>
-          <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="读取桶统计 GET /storage/admin/buckets/${BUCKET}_${STATS_IDX}/stats" enabled="true">
-            <intProp name="HTTPSampler.connect_timeout">10000</intProp>
-            <intProp name="HTTPSampler.response_timeout">10000</intProp>
-            <stringProp name="HTTPSampler.domain">${NODE1_HOST}</stringProp>
-            <stringProp name="HTTPSampler.port">${NODE1_PORT}</stringProp>
-            <stringProp name="HTTPSampler.protocol">http</stringProp>
-            <stringProp name="HTTPSampler.contentEncoding">UTF-8</stringProp>
-            <stringProp name="HTTPSampler.path">/storage/admin/buckets/${BUCKET}_${STATS_IDX}/stats?refresh=true</stringProp>
-            <boolProp name="HTTPSampler.follow_redirects">true</boolProp>
-            <stringProp name="HTTPSampler.method">GET</stringProp>
-            <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
-            <boolProp name="HTTPSampler.postBodyRaw">false</boolProp>
-            <elementProp name="HTTPsampler.Arguments" elementType="Arguments" guiclass="HTTPArgumentsPanel" testclass="Arguments" testname="用户定义的变量">
-              <collectionProp name="Arguments.arguments"/>
-            </elementProp>
-            <stringProp name="HTTPSampler.implementation">HttpClient4</stringProp>
-          </HTTPSamplerProxy>
-          <hashTree>
-            <JSR223PostProcessor guiclass="TestBeanGUI" testclass="JSR223PostProcessor" testname="累加 objectCount 到 props.TOTAL_COUNT" enabled="true">
-              <stringProp name="cacheKey">true</stringProp>
-              <stringProp name="filename"></stringProp>
-              <stringProp name="parameters"></stringProp>
-              <stringProp name="script">import groovy.json.JsonSlurper
-def resp = prev.getResponseDataAsString()
-def json = new JsonSlurper().parseText(resp)
-def count = json?.data?.objectCount
-if (count != null) {
-    synchronized (props) {
-        def cur = (props.get(&quot;TOTAL_COUNT&quot;) as Long) ?: 0L
-        props.put(&quot;TOTAL_COUNT&quot;, cur + (count as long))
+          <JSR223Sampler guiclass="TestBeanGUI" testclass="JSR223Sampler" testname="list 翻页统计桶对象数 ${BUCKET}_${STATS_IDX}" enabled="true">
+            <stringProp name="cacheKey">true</stringProp>
+            <stringProp name="filename"></stringProp>
+            <stringProp name="parameters"></stringProp>
+            <stringProp name="script">import groovy.json.JsonSlurper
+def host = vars.get(&quot;NODE1_HOST&quot;)
+def port = vars.get(&quot;NODE1_PORT&quot;)
+def bucket = vars.get(&quot;BUCKET&quot;) + &quot;_&quot; + vars.get(&quot;STATS_IDX&quot;)
+def base = &quot;http://&quot; + host + &quot;:&quot; + port + &quot;/storage/&quot; + bucket
+def marker = null
+def total = 0L
+def pages = 0
+def parser = new JsonSlurper()
+while (pages &lt; 100000) {
+    def url = base + &quot;?maxKeys=1000&quot; + (marker != null ? &quot;&amp;marker=&quot; + marker : &quot;&quot;)
+    def conn = new URL(url).openConnection()
+    conn.setRequestProperty(&quot;Accept&quot;, &quot;application/json&quot;)
+    conn.connectTimeout = 10000
+    conn.readTimeout = 120000
+    def code = conn.responseCode
+    if (code != 200) {
+        throw new Exception(&quot;list HTTP &quot; + code + &quot;: &quot; + url)
     }
-} else {
-    log.error(&quot;获取 objectCount 失败，响应=&quot; + resp)
-}</stringProp>
-              <stringProp name="scriptLanguage">groovy</stringProp>
-            </JSR223PostProcessor>
-            <hashTree/>
-          </hashTree>
+    def json = parser.parseText(conn.inputStream.getText(&quot;UTF-8&quot;))
+    total += (json.objects as List).size()
+    if (!json.truncated || json.nextMarker == null) {
+        break
+    }
+    marker = json.nextMarker
+    pages++
+}
+synchronized (props) {
+    def cur = (props.get(&quot;TOTAL_COUNT&quot;) as Long) ?: 0L
+    props.put(&quot;TOTAL_COUNT&quot;, cur + total)
+}
+log.info(&quot;桶 &quot; + bucket + &quot; 对象数=&quot; + total)
+SampleResult.setSuccessful(true)</stringProp>
+            <stringProp name="scriptLanguage">groovy</stringProp>
+          </JSR223Sampler>
+          <hashTree/>
         </hashTree>
         <JSR223Sampler guiclass="TestBeanGUI" testclass="JSR223Sampler" testname="比对：实际文件数 vs 请求成功数" enabled="true">
           <stringProp name="cacheKey">true</stringProp>
@@ -714,14 +628,14 @@ if (!pass) {
           <stringProp name="LoopController.loops">${VERIFY_SAMPLES}</stringProp>
         </LoopController>
         <hashTree>
-          <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="随机下载已上传文件 GET .../objects/${RAND_KEY_VERIFY}" enabled="true">
+          <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="随机下载已上传文件 GET /storage/${RAND_VERIFY_BUCKET}/${RAND_KEY_VERIFY}.jpg" enabled="true">
             <intProp name="HTTPSampler.connect_timeout">10000</intProp>
             <intProp name="HTTPSampler.response_timeout">10000</intProp>
             <stringProp name="HTTPSampler.domain">${NODE1_HOST}</stringProp>
             <stringProp name="HTTPSampler.port">${NODE1_PORT}</stringProp>
             <stringProp name="HTTPSampler.protocol">http</stringProp>
             <stringProp name="HTTPSampler.contentEncoding">UTF-8</stringProp>
-            <stringProp name="HTTPSampler.path">/storage/buckets/${RAND_VERIFY_BUCKET}/objects/${RAND_KEY_VERIFY}.jpg</stringProp>
+            <stringProp name="HTTPSampler.path">/storage/${RAND_VERIFY_BUCKET}/${RAND_KEY_VERIFY}.jpg</stringProp>
             <boolProp name="HTTPSampler.follow_redirects">true</boolProp>
             <stringProp name="HTTPSampler.method">GET</stringProp>
             <boolProp name="HTTPSampler.use_keepalive">true</boolProp>

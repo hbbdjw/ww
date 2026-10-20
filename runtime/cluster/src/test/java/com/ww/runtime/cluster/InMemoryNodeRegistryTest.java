@@ -138,7 +138,7 @@ class InMemoryNodeRegistryTest {
         // 同态 ACTIVE -> ACTIVE 非法
         assertThatThrownBy(() -> registry.markState(n3, NodeState.ACTIVE))
                 .isInstanceOf(IllegalStateTransitionException.class);
-        // DEAD 为终态
+        // DEAD 复活仅允许经重新注册（DEAD -> ACTIVE 捷径非法）
         assertThatThrownBy(() -> registry.markState(n4, NodeState.ACTIVE))
                 .isInstanceOf(IllegalStateTransitionException.class)
                 .hasMessageContaining("DEAD -> ACTIVE");

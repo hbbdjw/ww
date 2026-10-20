@@ -1,6 +1,6 @@
 package com.ww.runtime.data.storage;
 
-import com.ww.storage.ObjectMetadata;
+import com.ww.runtime.data.storage.engine.ObjectMetadata;
 
 import java.util.Objects;
 

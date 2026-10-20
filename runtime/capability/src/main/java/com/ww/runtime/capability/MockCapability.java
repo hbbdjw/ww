@@ -94,14 +94,7 @@ public final class MockCapability implements CapabilityModule {
         Objects.requireNonNull(key, "key");
         Objects.requireNonNull(value, "value");
         int partition = partitionOf(key);
-        Optional<PlacementView.Owner> owner = view.owner(type(), PartitionId.of(partition));
-        if (owner.isEmpty()) {
-            throw new StaleEpochException(expectedEpoch, -1L);
-        }
-        PlacementView.Owner o = owner.get();
-        if (!o.node().equals(self) || o.epoch() != expectedEpoch) {
-            throw new StaleEpochException(expectedEpoch, o.epoch());
-        }
+        view.checkWritable(type(), PartitionId.of(partition), self, expectedEpoch);
         data.put(key, value);
         totalPuts.incrementAndGet();
     }

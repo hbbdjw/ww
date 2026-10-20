@@ -45,7 +45,7 @@ class NodeRuntimeTest {
         clock = new TestClock(1_000L);
         monitor = new SequenceMonitor(clock, monitorFailureCount);
         host = new GrpcServerHost();
-        runtime = new NodeRuntime(NodeId.of("n1"), "localhost", 0, 1.0,
+        runtime = new NodeRuntime(NodeId.of("n1"), "localhost", 0, 8080, 1.0,
                 registry, host, monitor, clock, heartbeatIntervalMs);
         return runtime;
     }
@@ -83,7 +83,7 @@ class NodeRuntimeTest {
         host.start(0);
         int boundPort = host.getPort();
 
-        runtime = new NodeRuntime(NodeId.of("n1"), "localhost", 0, 1.0,
+        runtime = new NodeRuntime(NodeId.of("n1"), "localhost", 0, 8080, 1.0,
                 registry, host, monitor, clock, 60_000L);
         runtime.start();
 

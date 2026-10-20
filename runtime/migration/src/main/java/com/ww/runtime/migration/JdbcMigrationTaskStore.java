@@ -31,8 +31,8 @@ import java.util.Optional;
  *   <li>saveProgress：{@code checkpoint_json = COALESCE(?, checkpoint_json)}——传 null 保留原值。</li>
  * </ul>
  *
- * <p><b>测试说明：</b>本模块单测无 PostgreSQL 环境，仅保证编译通过与异常包装语义；
- * 真实数据库行为由后续 Testcontainers/嵌入式 PG 集成测试覆盖。</p>
+ * <p><b>测试说明：</b>本模块单测无 PostgreSQL 环境，仅验证异常包装语义；
+ * 真实数据库行为由集成测试覆盖。</p>
  */
 public final class JdbcMigrationTaskStore implements MigrationTaskStore {
 

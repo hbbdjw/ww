@@ -42,6 +42,8 @@ public final class GrpcNodeCommandChannel implements NodeCommandChannel, AutoClo
     private final NodeRegistry registry;
     private final long deadlineMillis;
     private final ConcurrentHashMap<String, ManagedChannel> channels = new ConcurrentHashMap<>();
+    /** A3：node → target 映射（通道按 target 缓存，驱逐需反查节点占用的通道）。 */
+    private final ConcurrentHashMap<NodeId, String> nodeTargets = new ConcurrentHashMap<>();
 
     public GrpcNodeCommandChannel(NodeId self, LocalNodeCommandChannel local, NodeRegistry registry) {
         this(self, local, registry, DEFAULT_DEADLINE_MILLIS);
@@ -125,6 +127,32 @@ public final class GrpcNodeCommandChannel implements NodeCommandChannel, AutoClo
             }
         });
         channels.clear();
+        nodeTargets.clear();
+    }
+
+    /**
+     * A3：驱逐已下线节点的缓存通道（成员事件驱动：节点判 DEAD/退役后调用）。
+     * target 仍被其他在用节点引用（同机多实例）时保留通道，只摘除该节点的映射。
+     * 通道关闭幂等；节点若复活，{@link #stubFor} 会按 target 重建/复用。
+     */
+    public void evictNode(NodeId node) {
+        String target = nodeTargets.remove(node);
+        if (target == null) {
+            return;
+        }
+        boolean stillReferenced = nodeTargets.containsValue(target);
+        if (!stillReferenced) {
+            ManagedChannel channel = channels.remove(target);
+            if (channel != null) {
+                LOG.info("evicting command channel to {} (node {} offline)", target, node);
+                channel.shutdown();
+            }
+        }
+    }
+
+    /** 当前缓存通道数（观测/测试）。 */
+    public int cachedChannelCount() {
+        return channels.size();
     }
 
     private ClusterControlGrpc.ClusterControlBlockingStub stubFor(NodeId node) {
@@ -145,6 +173,8 @@ public final class GrpcNodeCommandChannel implements NodeCommandChannel, AutoClo
             return null;
         }
         String target = info.host() + ":" + info.grpcPort();
+        // A3：记录 node→target 映射，供成员事件驱动的通道驱逐反查
+        nodeTargets.put(node, target);
         ManagedChannel channel = channels.computeIfAbsent(target,
                 key -> ManagedChannelBuilder.forTarget(key).usePlaintext().build());
         return ClusterControlGrpc.newBlockingStub(channel)

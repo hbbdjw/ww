@@ -13,6 +13,11 @@ dist/
 # Node.js / Frontend
 node_modules/
 ww-ui/dist/
+runtime/runtime-ui/node_modules/
+runtime/runtime-ui/.npm-cache/
+runtime/runtime-ui/.pnpm-store/
+runtime/server/src/main/resources/static/*
+!runtime/server/src/main/resources/static/.gitkeep
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
@@ -35,6 +40,7 @@ dist.zip
 !.node-version
 !.commitlintrc.js
 !.stylelintignore
+!.gitkeep
 
 # ================== IDE files ==================
 *.iws
@@ -65,3 +71,5 @@ logs/
 .env.local
 .env.*.local
 docker-compose.override.yml
+/settings-local.xml
+/runtime/data/node0/

@@ -68,11 +68,21 @@
             <artifactId>runtime-log</artifactId>
             <version>${project.version}</version>
         </dependency>
+        <!-- Controller 层负载均衡核心（Spring-free；过滤器/管理端点装配见 server.lb 包） -->
+        <dependency>
+            <groupId>com.ww</groupId>
+            <artifactId>runtime-lb</artifactId>
+            <version>${project.version}</version>
+        </dependency>
 
         <!-- 宿主基础设施：REST 管理端点 + HikariCP DataSource -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-security</artifactId>
         </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>
@@ -87,6 +97,12 @@
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- Security MockMvc 支持（springSecurity() 装配与 @AuthenticationPrincipal），版本由 Boot BOM 管理 -->
+        <dependency>
+            <groupId>org.springframework.security</groupId>
+            <artifactId>spring-security-test</artifactId>
             <scope>test</scope>
         </dependency>
         <!-- Boot 4 starter-test 不再传递 awaitility，显式引入（版本由 Boot BOM 管理）供轮询断言 -->

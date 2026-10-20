@@ -41,6 +41,7 @@
         <module>migration</module>
         <module>log</module>
         <module>data</module>
+        <module>lb</module>
         <module>server</module>
     </modules>
 </project>

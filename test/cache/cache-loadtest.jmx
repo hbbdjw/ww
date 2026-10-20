@@ -1,0 +1,706 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<jmeterTestPlan version="1.2" properties="5.0" jmeter="5.6.3">
+  <hashTree>
+    <TestPlan guiclass="TestPlanGui" testclass="TestPlan" testname="ww cache 分布式缓存灌注压测">
+      <stringProp name="TestPlan.comments">ww 项目 runtime-server CACHE 网关稳定性压测脚本：setUp 就绪检查+基线快照 → 三组并发施压（writer 确定性灌注 / reader 读回值校验 / ops 低频管理面+删除混合）→ tearDown 分布汇总与可选清理。每个请求随机路由到 NODE_PORTS 中任一节点，覆盖「任意节点可调用 + 网关按 placement 自动转发」路径。key 参数全部由全局序号 n 确定性推导（text/json、三档大小、5% 短 TTL），reader 无需共享存储即可重建期望值做一致性校验。期间出现 409/423/503 均判为失败（稳定性监测点）。</stringProp>
+      <boolProp name="TestPlan.tearDown_on_shutdown">true</boolProp>
+      <elementProp name="TestPlan.user_defined_variables" elementType="Arguments" guiclass="ArgumentsPanel" testclass="Arguments" testname="用户定义的变量">
+        <collectionProp name="Arguments.arguments">
+          <elementProp name="HOST" elementType="Argument">
+            <stringProp name="Argument.name">HOST</stringProp>
+            <stringProp name="Argument.value">127.0.0.1</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+          </elementProp>
+          <elementProp name="NODE_PORTS" elementType="Argument">
+            <stringProp name="Argument.name">NODE_PORTS</stringProp>
+            <stringProp name="Argument.value">8091,8092,8093,8094</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+          </elementProp>
+          <elementProp name="KEY_PREFIX" elementType="Argument">
+            <stringProp name="Argument.name">KEY_PREFIX</stringProp>
+            <stringProp name="Argument.value">ld</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+          </elementProp>
+          <elementProp name="WRITER_THREADS" elementType="Argument">
+            <stringProp name="Argument.name">WRITER_THREADS</stringProp>
+            <stringProp name="Argument.value">16</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+          </elementProp>
+          <elementProp name="READER_THREADS" elementType="Argument">
+            <stringProp name="Argument.name">READER_THREADS</stringProp>
+            <stringProp name="Argument.value">8</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+          </elementProp>
+          <elementProp name="OPS_THREADS" elementType="Argument">
+            <stringProp name="Argument.name">OPS_THREADS</stringProp>
+            <stringProp name="Argument.value">1</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+          </elementProp>
+          <elementProp name="RAMPUP" elementType="Argument">
+            <stringProp name="Argument.name">RAMPUP</stringProp>
+            <stringProp name="Argument.value">15</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+          </elementProp>
+          <elementProp name="DURATION" elementType="Argument">
+            <stringProp name="Argument.name">DURATION</stringProp>
+            <stringProp name="Argument.value">600</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+          </elementProp>
+          <elementProp name="SIZE_S" elementType="Argument">
+            <stringProp name="Argument.name">SIZE_S</stringProp>
+            <stringProp name="Argument.value">128</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+          </elementProp>
+          <elementProp name="SIZE_M" elementType="Argument">
+            <stringProp name="Argument.name">SIZE_M</stringProp>
+            <stringProp name="Argument.value">2048</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+          </elementProp>
+          <elementProp name="SIZE_L" elementType="Argument">
+            <stringProp name="Argument.name">SIZE_L</stringProp>
+            <stringProp name="Argument.value">16384</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+          </elementProp>
+          <elementProp name="CLEANUP" elementType="Argument">
+            <stringProp name="Argument.name">CLEANUP</stringProp>
+            <stringProp name="Argument.value">false</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+          </elementProp>
+        </collectionProp>
+      </elementProp>
+    </TestPlan>
+    <hashTree>
+      <SetupThreadGroup guiclass="SetupThreadGroupGui" testclass="SetupThreadGroup" testname="setUp-集群就绪检查+基线快照">
+        <intProp name="ThreadGroup.num_threads">1</intProp>
+        <intProp name="ThreadGroup.ramp_time">1</intProp>
+        <boolProp name="ThreadGroup.same_user_on_next_iteration">true</boolProp>
+        <stringProp name="ThreadGroup.on_sample_error">stoptest</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController" guiclass="LoopControlPanel" testclass="LoopController" testname="循环控制器">
+          <stringProp name="LoopController.loops">1</stringProp>
+          <boolProp name="LoopController.continue_forever">false</boolProp>
+        </elementProp>
+      </SetupThreadGroup>
+      <hashTree>
+        <JSR223Sampler guiclass="TestBeanGUI" testclass="JSR223Sampler" testname="就绪检查：GET /rt/health + 前缀基线 total（内部重试 60 次 × 2 秒）" enabled="true">
+          <stringProp name="cacheKey">true</stringProp>
+          <stringProp name="filename"></stringProp>
+          <stringProp name="parameters"></stringProp>
+          <stringProp name="script">import groovy.json.JsonSlurper
+def base = &apos;http://&apos; + vars.get(&apos;HOST&apos;) + &apos;:&apos; + vars.get(&apos;NODE_PORTS&apos;).split(&apos;,&apos;)[0].trim()
+def slurper = new JsonSlurper()
+long total = -1L
+for (int i = 0; i &lt; 60; i++) {
+    try {
+        def st = new URL(base + &apos;/rt/health&apos;).openConnection()
+        st.requestMethod = &apos;GET&apos;
+        st.connectTimeout = 5000
+        st.readTimeout = 5000
+        if (st.responseCode == 200) {
+            def ks = new URL(base + &apos;/cache/keys?prefix=&apos; + vars.get(&apos;KEY_PREFIX&apos;) + &apos;-&amp;limit=1&apos;).openConnection()
+            ks.requestMethod = &apos;GET&apos;
+            ks.connectTimeout = 5000
+            ks.readTimeout = 30000
+            if (ks.responseCode == 200) {
+                total = slurper.parseText(ks.inputStream.getText(&apos;UTF-8&apos;)).total
+                break
+            }
+        }
+    } catch (Exception e) {
+        // 未就绪：继续下一轮重试
+    }
+    Thread.sleep(2000)
+}
+if (total &lt; 0) {
+    SampleResult.setSuccessful(false)
+    SampleResult.setResponseCode(&apos;503&apos;)
+    SampleResult.setResponseMessage(&apos;集群 120 秒内未就绪（/rt/health 或 /cache/keys 不可用）&apos;)
+    return
+}
+props.put(&apos;ldBaselineTotal&apos;, String.valueOf(total))
+SampleResult.setResponseData(&apos;集群就绪，前缀基线 total=&apos; + total, &apos;UTF-8&apos;)</stringProp>
+          <stringProp name="scriptLanguage">groovy</stringProp>
+        </JSR223Sampler>
+        <hashTree/>
+      </hashTree>
+      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="writer-确定性灌注（持续 DURATION 秒）" enabled="true">
+        <stringProp name="ThreadGroup.num_threads">${WRITER_THREADS}</stringProp>
+        <intProp name="ThreadGroup.ramp_time">15</intProp>
+        <stringProp name="ThreadGroup.duration">${DURATION}</stringProp>
+        <longProp name="ThreadGroup.delay">0</longProp>
+        <boolProp name="ThreadGroup.same_user_on_next_iteration">true</boolProp>
+        <boolProp name="ThreadGroup.scheduler">true</boolProp>
+        <stringProp name="ThreadGroup.on_sample_error">continue</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController" guiclass="LoopControlPanel" testclass="LoopController" testname="循环控制器">
+          <intProp name="LoopController.loops">-1</intProp>
+          <boolProp name="LoopController.continue_forever">false</boolProp>
+        </elementProp>
+      </ThreadGroup>
+      <hashTree>
+        <JSR223PreProcessor guiclass="TestBeanGUI" testclass="JSR223PreProcessor" testname="生成写入参数（全局序号 n → 确定性 key/类型/大小/TTL + 随机节点）" enabled="true">
+          <stringProp name="cacheKey">true</stringProp>
+          <stringProp name="filename"></stringProp>
+          <stringProp name="parameters"></stringProp>
+          <stringProp name="script">if (props.get(&apos;ldCounter&apos;) == null) {
+    synchronized (props) {
+        if (props.get(&apos;ldCounter&apos;) == null) {
+            props.put(&apos;ldCounter&apos;, new java.util.concurrent.atomic.AtomicLong(0L))
+        }
+    }
+}
+long n = props.get(&apos;ldCounter&apos;).incrementAndGet()
+int m = (int) (n % 10)
+// 大小三档：70% 小 / 20% 中 / 10% 大
+int sz = (m &lt; 7) ? (vars.get(&apos;SIZE_S&apos;) as int) : ((m &lt; 9) ? (vars.get(&apos;SIZE_M&apos;) as int) : (vars.get(&apos;SIZE_L&apos;) as int))
+// 类型：20% json / 80% text
+String tp = (n % 5 == 0) ? &apos;json&apos; : &apos;text&apos;
+// TTL：5% 条目 30 秒过期（覆盖过期清理路径），其余永不过期
+long ttl = (n % 20 == 0) ? 30000L : 0L
+String key = vars.get(&apos;KEY_PREFIX&apos;) + &apos;-&apos; + n
+String body
+if (tp == &apos;text&apos;) {
+    body = &apos;v:&apos; + key + &apos;:&apos; + (&apos;p&apos; * (sz - (&apos;v:&apos; + key + &apos;:&apos;).length()))
+} else {
+    body = &apos;{&quot;k&quot;:&quot;&apos; + key + &apos;&quot;,&quot;n&quot;:&apos; + n + &apos;,&quot;pad&quot;:&quot;&apos; + (&apos;q&apos; * (int) (sz / 8)) + &apos;&quot;}&apos;
+}
+vars.put(&apos;N&apos;, String.valueOf(n))
+vars.put(&apos;KEY&apos;, key)
+vars.put(&apos;TYPE&apos;, tp)
+vars.put(&apos;TTL&apos;, String.valueOf(ttl))
+vars.put(&apos;BODY&apos;, body)
+// 随机路由到任一节点：覆盖网关自动转发路径
+def ports = vars.get(&apos;NODE_PORTS&apos;).split(&apos;,&apos;)
+vars.put(&apos;PORT&apos;, ports[(int) (Math.random() * ports.length)].trim())</stringProp>
+          <stringProp name="scriptLanguage">groovy</stringProp>
+        </JSR223PreProcessor>
+        <hashTree/>
+        <IfController guiclass="IfControllerPanel" testclass="IfController" testname="分支-text 写入" enabled="true">
+          <stringProp name="IfController.condition">${__jexl3(vars.get(&apos;TYPE&apos;) == &apos;text&apos;)}</stringProp>
+          <boolProp name="IfController.evaluateAll">false</boolProp>
+          <boolProp name="IfController.useExpression">true</boolProp>
+        </IfController>
+        <hashTree>
+          <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="PUT-text /cache/${KEY}" enabled="true">
+            <intProp name="HTTPSampler.connect_timeout">10000</intProp>
+            <intProp name="HTTPSampler.response_timeout">30000</intProp>
+            <stringProp name="HTTPSampler.domain">${HOST}</stringProp>
+            <stringProp name="HTTPSampler.port">${PORT}</stringProp>
+            <stringProp name="HTTPSampler.protocol">http</stringProp>
+            <stringProp name="HTTPSampler.contentEncoding">UTF-8</stringProp>
+            <stringProp name="HTTPSampler.path">/cache/${KEY}?type=${TYPE}&amp;ttl=${TTL}</stringProp>
+            <boolProp name="HTTPSampler.follow_redirects">true</boolProp>
+            <stringProp name="HTTPSampler.method">PUT</stringProp>
+            <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
+            <boolProp name="HTTPSampler.postBodyRaw">true</boolProp>
+            <elementProp name="HTTPsampler.Arguments" elementType="Arguments">
+              <collectionProp name="Arguments.arguments">
+                <elementProp name="" elementType="HTTPArgument">
+                  <boolProp name="HTTPArgument.always_encode">false</boolProp>
+                  <stringProp name="Argument.value">${BODY}</stringProp>
+                  <stringProp name="Argument.metadata">=</stringProp>
+                </elementProp>
+              </collectionProp>
+            </elementProp>
+            <stringProp name="HTTPSampler.implementation">HttpClient4</stringProp>
+          </HTTPSamplerProxy>
+          <hashTree>
+            <HeaderManager guiclass="HeaderPanel" testclass="HeaderManager" testname="text 请求头" enabled="true">
+              <collectionProp name="HeaderManager.headers">
+                <elementProp name="" elementType="Header">
+                  <stringProp name="Header.name">Content-Type</stringProp>
+                  <stringProp name="Header.value">text/plain; charset=UTF-8</stringProp>
+                </elementProp>
+              </collectionProp>
+            </HeaderManager>
+            <hashTree/>
+            <JSR223Assertion guiclass="TestBeanGUI" testclass="JSR223Assertion" testname="断言 200 + ok=true" enabled="true">
+              <stringProp name="cacheKey">true</stringProp>
+              <stringProp name="filename"></stringProp>
+              <stringProp name="parameters"></stringProp>
+              <stringProp name="script">def code = SampleResult.getResponseCode()
+if (code != &apos;200&apos;) {
+    AssertionResult.setFailure(true)
+    AssertionResult.setFailureMessage(&apos;PUT 期望 200，实际 &apos; + code + &apos;: &apos; + SampleResult.getResponseDataAsString())
+} else if (!SampleResult.getResponseDataAsString().contains(&apos;&quot;ok&quot;:true&apos;)) {
+    AssertionResult.setFailure(true)
+    AssertionResult.setFailureMessage(&apos;PUT 响应缺少 ok=true: &apos; + SampleResult.getResponseDataAsString())
+}</stringProp>
+              <stringProp name="scriptLanguage">groovy</stringProp>
+            </JSR223Assertion>
+            <hashTree/>
+          </hashTree>
+        </hashTree>
+        <IfController guiclass="IfControllerPanel" testclass="IfController" testname="分支-json 写入" enabled="true">
+          <stringProp name="IfController.condition">${__jexl3(vars.get(&apos;TYPE&apos;) == &apos;json&apos;)}</stringProp>
+          <boolProp name="IfController.evaluateAll">false</boolProp>
+          <boolProp name="IfController.useExpression">true</boolProp>
+        </IfController>
+        <hashTree>
+          <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="PUT-json /cache/${KEY}" enabled="true">
+            <intProp name="HTTPSampler.connect_timeout">10000</intProp>
+            <intProp name="HTTPSampler.response_timeout">30000</intProp>
+            <stringProp name="HTTPSampler.domain">${HOST}</stringProp>
+            <stringProp name="HTTPSampler.port">${PORT}</stringProp>
+            <stringProp name="HTTPSampler.protocol">http</stringProp>
+            <stringProp name="HTTPSampler.contentEncoding">UTF-8</stringProp>
+            <stringProp name="HTTPSampler.path">/cache/${KEY}?type=${TYPE}&amp;ttl=${TTL}</stringProp>
+            <boolProp name="HTTPSampler.follow_redirects">true</boolProp>
+            <stringProp name="HTTPSampler.method">PUT</stringProp>
+            <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
+            <boolProp name="HTTPSampler.postBodyRaw">true</boolProp>
+            <elementProp name="HTTPsampler.Arguments" elementType="Arguments">
+              <collectionProp name="Arguments.arguments">
+                <elementProp name="" elementType="HTTPArgument">
+                  <boolProp name="HTTPArgument.always_encode">false</boolProp>
+                  <stringProp name="Argument.value">${BODY}</stringProp>
+                  <stringProp name="Argument.metadata">=</stringProp>
+                </elementProp>
+              </collectionProp>
+            </elementProp>
+            <stringProp name="HTTPSampler.implementation">HttpClient4</stringProp>
+          </HTTPSamplerProxy>
+          <hashTree>
+            <HeaderManager guiclass="HeaderPanel" testclass="HeaderManager" testname="json 请求头" enabled="true">
+              <collectionProp name="HeaderManager.headers">
+                <elementProp name="" elementType="Header">
+                  <stringProp name="Header.name">Content-Type</stringProp>
+                  <stringProp name="Header.value">application/json</stringProp>
+                </elementProp>
+              </collectionProp>
+            </HeaderManager>
+            <hashTree/>
+            <JSR223Assertion guiclass="TestBeanGUI" testclass="JSR223Assertion" testname="断言 200 + ok=true" enabled="true">
+              <stringProp name="cacheKey">true</stringProp>
+              <stringProp name="filename"></stringProp>
+              <stringProp name="parameters"></stringProp>
+              <stringProp name="script">def code = SampleResult.getResponseCode()
+if (code != &apos;200&apos;) {
+    AssertionResult.setFailure(true)
+    AssertionResult.setFailureMessage(&apos;PUT 期望 200，实际 &apos; + code + &apos;: &apos; + SampleResult.getResponseDataAsString())
+} else if (!SampleResult.getResponseDataAsString().contains(&apos;&quot;ok&quot;:true&apos;)) {
+    AssertionResult.setFailure(true)
+    AssertionResult.setFailureMessage(&apos;PUT 响应缺少 ok=true: &apos; + SampleResult.getResponseDataAsString())
+}</stringProp>
+              <stringProp name="scriptLanguage">groovy</stringProp>
+            </JSR223Assertion>
+            <hashTree/>
+          </hashTree>
+        </hashTree>
+      </hashTree>
+      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="reader-读回校验（持续 DURATION 秒）" enabled="true">
+        <stringProp name="ThreadGroup.num_threads">${READER_THREADS}</stringProp>
+        <intProp name="ThreadGroup.ramp_time">15</intProp>
+        <stringProp name="ThreadGroup.duration">${DURATION}</stringProp>
+        <longProp name="ThreadGroup.delay">15</longProp>
+        <boolProp name="ThreadGroup.same_user_on_next_iteration">true</boolProp>
+        <boolProp name="ThreadGroup.scheduler">true</boolProp>
+        <stringProp name="ThreadGroup.on_sample_error">continue</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController" guiclass="LoopControlPanel" testclass="LoopController" testname="循环控制器">
+          <intProp name="LoopController.loops">-1</intProp>
+          <boolProp name="LoopController.continue_forever">false</boolProp>
+        </elementProp>
+      </ThreadGroup>
+      <hashTree>
+        <JSR223PreProcessor guiclass="TestBeanGUI" testclass="JSR223PreProcessor" testname="选择已写 key（随机 n，避开短 TTL 档位）" enabled="true">
+          <stringProp name="cacheKey">true</stringProp>
+          <stringProp name="filename"></stringProp>
+          <stringProp name="parameters"></stringProp>
+          <stringProp name="script">def ctr = props.get(&apos;ldCounter&apos;)
+long max = (ctr == null) ? 0L : ctr.get()
+if (max &lt; 1) {
+    // writer 尚未写入：跳过本迭代（If 条件下一迭代生效），KEY 兜底防路径变量未定义
+    vars.put(&apos;SKIP&apos;, &apos;true&apos;)
+    vars.put(&apos;KEY&apos;, vars.get(&apos;KEY_PREFIX&apos;) + &apos;-1&apos;)
+} else {
+    vars.put(&apos;SKIP&apos;, &apos;false&apos;)
+    long n = 1L + (long) (Math.random() * max)
+    // 避开短 TTL 档位（n%20==0 的 key 可能已过期，用于校验读会误报）
+    if (n % 20 == 0 &amp;&amp; n &lt; max) {
+        n = n + 1
+    }
+    vars.put(&apos;N&apos;, String.valueOf(n))
+    vars.put(&apos;KEY&apos;, vars.get(&apos;KEY_PREFIX&apos;) + &apos;-&apos; + n)
+}
+def ports = vars.get(&apos;NODE_PORTS&apos;).split(&apos;,&apos;)
+vars.put(&apos;PORT&apos;, ports[(int) (Math.random() * ports.length)].trim())</stringProp>
+          <stringProp name="scriptLanguage">groovy</stringProp>
+        </JSR223PreProcessor>
+        <hashTree/>
+        <IfController guiclass="IfControllerPanel" testclass="IfController" testname="已有关键数据才读" enabled="true">
+          <stringProp name="IfController.condition">${__jexl3(vars.get(&apos;SKIP&apos;) != &apos;true&apos;)}</stringProp>
+          <boolProp name="IfController.evaluateAll">false</boolProp>
+          <boolProp name="IfController.useExpression">true</boolProp>
+        </IfController>
+        <hashTree>
+          <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="GET-读回 /cache/${KEY}" enabled="true">
+            <intProp name="HTTPSampler.connect_timeout">10000</intProp>
+            <intProp name="HTTPSampler.response_timeout">30000</intProp>
+            <stringProp name="HTTPSampler.domain">${HOST}</stringProp>
+            <stringProp name="HTTPSampler.port">${PORT}</stringProp>
+            <stringProp name="HTTPSampler.protocol">http</stringProp>
+            <stringProp name="HTTPSampler.contentEncoding">UTF-8</stringProp>
+            <stringProp name="HTTPSampler.path">/cache/${KEY}</stringProp>
+            <boolProp name="HTTPSampler.follow_redirects">true</boolProp>
+            <stringProp name="HTTPSampler.method">GET</stringProp>
+            <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
+            <boolProp name="HTTPSampler.postBodyRaw">false</boolProp>
+            <elementProp name="HTTPsampler.Arguments" elementType="Arguments" guiclass="HTTPArgumentsPanel" testclass="Arguments" testname="用户定义的变量">
+              <collectionProp name="Arguments.arguments"/>
+            </elementProp>
+            <stringProp name="HTTPSampler.implementation">HttpClient4</stringProp>
+          </HTTPSamplerProxy>
+          <hashTree>
+            <JSR223Assertion guiclass="TestBeanGUI" testclass="JSR223Assertion" testname="断言 200/404 + 值一致性校验（确定性重建）" enabled="true">
+              <stringProp name="cacheKey">true</stringProp>
+              <stringProp name="filename"></stringProp>
+              <stringProp name="parameters"></stringProp>
+              <stringProp name="script">def code = SampleResult.getResponseCode()
+if (code != &apos;200&apos; &amp;&amp; code != &apos;404&apos;) {
+    AssertionResult.setFailure(true)
+    AssertionResult.setFailureMessage(&apos;GET 期望 200/404，实际 &apos; + code + &apos;: &apos; + SampleResult.getResponseDataAsString())
+    return
+}
+if (code == &apos;404&apos;) {
+    return  // 已过期（短 TTL）或被 ops 组删除：预期内
+}
+// 200：按全局序号 n 确定性重建期望值做一致性校验
+long n = Long.parseLong(vars.get(&apos;N&apos;))
+long m = n % 10
+int sz = (m &lt; 7) ? (vars.get(&apos;SIZE_S&apos;) as int) : ((m &lt; 9) ? (vars.get(&apos;SIZE_M&apos;) as int) : (vars.get(&apos;SIZE_L&apos;) as int))
+String tp = (n % 5 == 0) ? &apos;json&apos; : &apos;text&apos;
+String key = vars.get(&apos;KEY&apos;)
+def json = new groovy.json.JsonSlurper().parseText(SampleResult.getResponseDataAsString())
+def ok = (json.type == tp)
+if (ok &amp;&amp; tp == &apos;text&apos;) {
+    String expected = &apos;v:&apos; + key + &apos;:&apos; + (&apos;p&apos; * (sz - (&apos;v:&apos; + key + &apos;:&apos;).length()))
+    ok = (json.value == expected)
+} else if (ok) {
+    ok = (json.value.k == key) &amp;&amp; (json.value.n == n) &amp;&amp; (json.value.pad != null) &amp;&amp; (json.value.pad.length() == (int) (sz / 8))
+}
+if (!ok) {
+    AssertionResult.setFailure(true)
+    AssertionResult.setFailureMessage(&apos;值校验失败 key=&apos; + key + &apos; type=&apos; + tp + &apos; resp=&apos; + SampleResult.getResponseDataAsString().take(200))
+}</stringProp>
+              <stringProp name="scriptLanguage">groovy</stringProp>
+            </JSR223Assertion>
+            <hashTree/>
+          </hashTree>
+        </hashTree>
+      </hashTree>
+      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="ops-管理面+删除混合（低频）" enabled="true">
+        <stringProp name="ThreadGroup.num_threads">${OPS_THREADS}</stringProp>
+        <intProp name="ThreadGroup.ramp_time">1</intProp>
+        <stringProp name="ThreadGroup.duration">${DURATION}</stringProp>
+        <longProp name="ThreadGroup.delay">10</longProp>
+        <boolProp name="ThreadGroup.same_user_on_next_iteration">true</boolProp>
+        <boolProp name="ThreadGroup.scheduler">true</boolProp>
+        <stringProp name="ThreadGroup.on_sample_error">continue</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController" guiclass="LoopControlPanel" testclass="LoopController" testname="循环控制器">
+          <intProp name="LoopController.loops">-1</intProp>
+          <boolProp name="LoopController.continue_forever">false</boolProp>
+        </elementProp>
+      </ThreadGroup>
+      <hashTree>
+        <ConstantTimer guiclass="ConstantTimerGui" testclass="ConstantTimer" testname="低频间隔 10 秒" enabled="true">
+          <stringProp name="ConstantTimer.delay">10000</stringProp>
+        </ConstantTimer>
+        <hashTree/>
+        <JSR223PreProcessor guiclass="TestBeanGUI" testclass="JSR223PreProcessor" testname="随机 key + 随机节点" enabled="true">
+          <stringProp name="cacheKey">true</stringProp>
+          <stringProp name="filename"></stringProp>
+          <stringProp name="parameters"></stringProp>
+          <stringProp name="script">def ctr = props.get(&apos;ldCounter&apos;)
+long max = (ctr == null) ? 0L : ctr.get()
+long n = (max &gt;= 1) ? (1L + (long) (Math.random() * max)) : 1L
+vars.put(&apos;KEY&apos;, vars.get(&apos;KEY_PREFIX&apos;) + &apos;-&apos; + n)
+def ports = vars.get(&apos;NODE_PORTS&apos;).split(&apos;,&apos;)
+vars.put(&apos;PORT&apos;, ports[(int) (Math.random() * ports.length)].trim())</stringProp>
+          <stringProp name="scriptLanguage">groovy</stringProp>
+        </JSR223PreProcessor>
+        <hashTree/>
+        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="GET-keys 管理面列举" enabled="true">
+          <intProp name="HTTPSampler.connect_timeout">10000</intProp>
+          <intProp name="HTTPSampler.response_timeout">60000</intProp>
+          <stringProp name="HTTPSampler.domain">${HOST}</stringProp>
+          <stringProp name="HTTPSampler.port">${PORT}</stringProp>
+          <stringProp name="HTTPSampler.protocol">http</stringProp>
+          <stringProp name="HTTPSampler.contentEncoding">UTF-8</stringProp>
+          <stringProp name="HTTPSampler.path">/cache/keys?prefix=${KEY_PREFIX}-&amp;limit=200</stringProp>
+          <boolProp name="HTTPSampler.follow_redirects">true</boolProp>
+          <stringProp name="HTTPSampler.method">GET</stringProp>
+          <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
+          <boolProp name="HTTPSampler.postBodyRaw">false</boolProp>
+          <elementProp name="HTTPsampler.Arguments" elementType="Arguments" guiclass="HTTPArgumentsPanel" testclass="Arguments" testname="用户定义的变量">
+            <collectionProp name="Arguments.arguments"/>
+          </elementProp>
+          <stringProp name="HTTPSampler.implementation">HttpClient4</stringProp>
+        </HTTPSamplerProxy>
+        <hashTree>
+          <JSR223Assertion guiclass="TestBeanGUI" testclass="JSR223Assertion" testname="断言 200" enabled="true">
+            <stringProp name="cacheKey">true</stringProp>
+            <stringProp name="filename"></stringProp>
+            <stringProp name="parameters"></stringProp>
+            <stringProp name="script">def code = SampleResult.getResponseCode()
+if (code != &apos;200&apos;) {
+    AssertionResult.setFailure(true)
+    AssertionResult.setFailureMessage(&apos;keys 列举期望 200，实际 &apos; + code + &apos;: &apos; + SampleResult.getResponseDataAsString().take(300))
+}</stringProp>
+            <stringProp name="scriptLanguage">groovy</stringProp>
+          </JSR223Assertion>
+          <hashTree/>
+        </hashTree>
+        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="GET-node-stats 每节点统计" enabled="true">
+          <intProp name="HTTPSampler.connect_timeout">10000</intProp>
+          <intProp name="HTTPSampler.response_timeout">60000</intProp>
+          <stringProp name="HTTPSampler.domain">${HOST}</stringProp>
+          <stringProp name="HTTPSampler.port">${PORT}</stringProp>
+          <stringProp name="HTTPSampler.protocol">http</stringProp>
+          <stringProp name="HTTPSampler.contentEncoding">UTF-8</stringProp>
+          <stringProp name="HTTPSampler.path">/rt/cache/node-stats</stringProp>
+          <boolProp name="HTTPSampler.follow_redirects">true</boolProp>
+          <stringProp name="HTTPSampler.method">GET</stringProp>
+          <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
+          <boolProp name="HTTPSampler.postBodyRaw">false</boolProp>
+          <elementProp name="HTTPsampler.Arguments" elementType="Arguments" guiclass="HTTPArgumentsPanel" testclass="Arguments" testname="用户定义的变量">
+            <collectionProp name="Arguments.arguments"/>
+          </elementProp>
+          <stringProp name="HTTPSampler.implementation">HttpClient4</stringProp>
+        </HTTPSamplerProxy>
+        <hashTree>
+          <JSR223Assertion guiclass="TestBeanGUI" testclass="JSR223Assertion" testname="断言 200 + 打印节点分布到日志" enabled="true">
+            <stringProp name="cacheKey">true</stringProp>
+            <stringProp name="filename"></stringProp>
+            <stringProp name="parameters"></stringProp>
+            <stringProp name="script">def code = SampleResult.getResponseCode()
+if (code != &apos;200&apos;) {
+    AssertionResult.setFailure(true)
+    AssertionResult.setFailureMessage(&apos;node-stats 期望 200，实际 &apos; + code + &apos;: &apos; + SampleResult.getResponseDataAsString().take(300))
+    return
+}
+def nodes = new groovy.json.JsonSlurper().parseText(SampleResult.getResponseDataAsString()).nodes
+def sb = new StringBuilder()
+nodes.each { nd -&gt; sb.append(nd.nodeId).append(&apos;=&apos;).append(nd.cacheActual).append(&apos;/keys:&apos;).append(nd.keyCount).append(&apos; &apos;) }
+log.info(&apos;[cache-loadtest] node-stats: &apos; + sb.toString())</stringProp>
+            <stringProp name="scriptLanguage">groovy</stringProp>
+          </JSR223Assertion>
+          <hashTree/>
+        </hashTree>
+        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="DELETE-删除 /cache/${KEY}" enabled="true">
+          <intProp name="HTTPSampler.connect_timeout">10000</intProp>
+          <intProp name="HTTPSampler.response_timeout">30000</intProp>
+          <stringProp name="HTTPSampler.domain">${HOST}</stringProp>
+          <stringProp name="HTTPSampler.port">${PORT}</stringProp>
+          <stringProp name="HTTPSampler.protocol">http</stringProp>
+          <stringProp name="HTTPSampler.contentEncoding">UTF-8</stringProp>
+          <stringProp name="HTTPSampler.path">/cache/${KEY}</stringProp>
+          <boolProp name="HTTPSampler.follow_redirects">true</boolProp>
+          <stringProp name="HTTPSampler.method">DELETE</stringProp>
+          <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
+          <boolProp name="HTTPSampler.postBodyRaw">false</boolProp>
+          <elementProp name="HTTPsampler.Arguments" elementType="Arguments" guiclass="HTTPArgumentsPanel" testclass="Arguments" testname="用户定义的变量">
+            <collectionProp name="Arguments.arguments"/>
+          </elementProp>
+          <stringProp name="HTTPSampler.implementation">HttpClient4</stringProp>
+        </HTTPSamplerProxy>
+        <hashTree>
+          <JSR223Assertion guiclass="TestBeanGUI" testclass="JSR223Assertion" testname="断言 204/404（删除成功或已不存在）" enabled="true">
+            <stringProp name="cacheKey">true</stringProp>
+            <stringProp name="filename"></stringProp>
+            <stringProp name="parameters"></stringProp>
+            <stringProp name="script">def code = SampleResult.getResponseCode()
+if (code != &apos;204&apos; &amp;&amp; code != &apos;404&apos;) {
+    AssertionResult.setFailure(true)
+    AssertionResult.setFailureMessage(&apos;DELETE 期望 204/404，实际 &apos; + code + &apos;: &apos; + SampleResult.getResponseDataAsString())
+}</stringProp>
+            <stringProp name="scriptLanguage">groovy</stringProp>
+          </JSR223Assertion>
+          <hashTree/>
+        </hashTree>
+      </hashTree>
+      <PostThreadGroup guiclass="PostThreadGroupGui" testclass="PostThreadGroup" testname="tearDown-汇总与可选清理">
+        <intProp name="ThreadGroup.num_threads">1</intProp>
+        <intProp name="ThreadGroup.ramp_time">1</intProp>
+        <boolProp name="ThreadGroup.same_user_on_next_iteration">true</boolProp>
+        <stringProp name="ThreadGroup.on_sample_error">continue</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController" guiclass="LoopControlPanel" testclass="LoopController" testname="循环控制器">
+          <stringProp name="LoopController.loops">1</stringProp>
+          <boolProp name="LoopController.continue_forever">false</boolProp>
+        </elementProp>
+      </PostThreadGroup>
+      <hashTree>
+        <JSR223Sampler guiclass="TestBeanGUI" testclass="JSR223Sampler" testname="汇总（前缀总量/净增/节点分布）+ 可选分批清理" enabled="true">
+          <stringProp name="cacheKey">true</stringProp>
+          <stringProp name="filename"></stringProp>
+          <stringProp name="parameters"></stringProp>
+          <stringProp name="script">import groovy.json.JsonSlurper
+def prefix = vars.get(&apos;KEY_PREFIX&apos;)
+def base = &apos;http://&apos; + vars.get(&apos;HOST&apos;) + &apos;:&apos; + vars.get(&apos;NODE_PORTS&apos;).split(&apos;,&apos;)[0].trim()
+def get = { String path -&gt;
+    def c = new URL(base + path).openConnection()
+    c.requestMethod = &apos;GET&apos;
+    c.connectTimeout = 10000
+    c.readTimeout = 60000
+    int code = c.responseCode
+    String body = (code == 200) ? c.inputStream.getText(&apos;UTF-8&apos;) : &apos;&apos;
+    return [code, body]
+}
+def delete = { String key -&gt;
+    def c = new URL(base + &apos;/cache/&apos; + key).openConnection()
+    c.requestMethod = &apos;DELETE&apos;
+    c.connectTimeout = 10000
+    c.readTimeout = 30000
+    return c.responseCode
+}
+def out = new StringBuilder()
+// 1) 前缀总量与净增（相对 setUp 基线）
+def (tCode, tBody) = get(&apos;/cache/keys?prefix=&apos; + prefix + &apos;-&amp;limit=1&apos;)
+long total = -1L
+if (tCode == 200) {
+    total = new JsonSlurper().parseText(tBody).total
+}
+long baseline = props.containsKey(&apos;ldBaselineTotal&apos;) ? Long.parseLong(props.get(&apos;ldBaselineTotal&apos;).toString()) : 0L
+out.append(&apos;prefix=&apos;).append(prefix).append(&apos; total=&apos;).append(total).append(&apos; baseline=&apos;).append(baseline).append(&apos; netNew=&apos;).append(total - baseline)
+// 2) 节点分布（打印到 jmeter.log 与采样响应）
+def (sCode, sBody) = get(&apos;/rt/cache/node-stats&apos;)
+if (sCode == 200) {
+    def nodes = new JsonSlurper().parseText(sBody).nodes
+    nodes.each { nd -&gt; out.append(&apos; | &apos;).append(nd.nodeId).append(&apos; &apos;).append(nd.cacheActual).append(&apos; keys=&apos;).append(nd.keyCount) }
+    log.info(&apos;[cache-loadtest] 最终汇总: &apos; + out.toString())
+}
+// 3) 可选清理：CLEANUP=true 时分批删除前缀全部 key（绕过 /keys 前缀删除的 1 万上限）
+if (&apos;true&apos;.equalsIgnoreCase(vars.get(&apos;CLEANUP&apos;))) {
+    long deleted = 0L
+    int guard = 0
+    while (guard++ &lt; 2000) {
+        def (kCode, kBody) = get(&apos;/cache/keys?prefix=&apos; + prefix + &apos;-&amp;limit=10000&apos;)
+        if (kCode != 200) {
+            out.append(&apos; | cleanupError=&apos;).append(kCode)
+            break
+        }
+        def keys = new JsonSlurper().parseText(kBody).keys.collect { it.key }
+        if (keys.isEmpty()) {
+            break
+        }
+        keys.each { k -&gt; if (delete(k) == 204) { deleted++ } }
+    }
+    out.append(&apos; | cleanupDeleted=&apos;).append(deleted)
+    log.info(&apos;[cache-loadtest] 清理完成: &apos; + out.toString())
+}
+SampleResult.setResponseData(out.toString(), &apos;UTF-8&apos;)</stringProp>
+          <stringProp name="scriptLanguage">groovy</stringProp>
+        </JSR223Sampler>
+        <hashTree/>
+      </hashTree>
+      <ResultCollector guiclass="ViewResultsFullVisualizer" testclass="ResultCollector" testname="查看结果树（仅错误）" enabled="true">
+        <boolProp name="ResultCollector.error_logging">false</boolProp>
+        <objProp>
+          <name>saveConfig</name>
+          <value class="SampleSaveConfiguration">
+            <time>true</time>
+            <latency>true</latency>
+            <timestamp>true</timestamp>
+            <success>true</success>
+            <label>true</label>
+            <code>true</code>
+            <message>true</message>
+            <threadName>true</threadName>
+            <dataType>true</dataType>
+            <encoding>false</encoding>
+            <assertions>true</assertions>
+            <subresults>true</subresults>
+            <responseData>false</responseData>
+            <samplerData>false</samplerData>
+            <xml>false</xml>
+            <fieldNames>true</fieldNames>
+            <responseHeaders>false</responseHeaders>
+            <requestHeaders>false</requestHeaders>
+            <responseDataOnError>true</responseDataOnError>
+            <saveAssertionResultsFailureMessage>true</saveAssertionResultsFailureMessage>
+            <assertionsResultsToSave>0</assertionsResultsToSave>
+            <bytes>true</bytes>
+            <sentBytes>true</sentBytes>
+            <url>true</url>
+            <threadCounts>true</threadCounts>
+            <idleTime>true</idleTime>
+            <connectTime>true</connectTime>
+          </value>
+        </objProp>
+        <stringProp name="filename"></stringProp>
+      </ResultCollector>
+      <hashTree/>
+      <ResultCollector guiclass="SummaryReport" testclass="ResultCollector" testname="汇总报告" enabled="true">
+        <boolProp name="ResultCollector.error_logging">false</boolProp>
+        <objProp>
+          <name>saveConfig</name>
+          <value class="SampleSaveConfiguration">
+            <time>true</time>
+            <latency>true</latency>
+            <timestamp>true</timestamp>
+            <success>true</success>
+            <label>true</label>
+            <code>true</code>
+            <message>true</message>
+            <threadName>true</threadName>
+            <dataType>true</dataType>
+            <encoding>false</encoding>
+            <assertions>true</assertions>
+            <subresults>true</subresults>
+            <responseData>false</responseData>
+            <samplerData>false</samplerData>
+            <xml>false</xml>
+            <fieldNames>true</fieldNames>
+            <responseHeaders>false</responseHeaders>
+            <requestHeaders>false</requestHeaders>
+            <responseDataOnError>false</responseDataOnError>
+            <saveAssertionResultsFailureMessage>true</saveAssertionResultsFailureMessage>
+            <assertionsResultsToSave>0</assertionsResultsToSave>
+            <bytes>true</bytes>
+            <sentBytes>true</sentBytes>
+            <url>true</url>
+            <threadCounts>true</threadCounts>
+            <idleTime>true</idleTime>
+            <connectTime>true</connectTime>
+          </value>
+        </objProp>
+        <stringProp name="filename"></stringProp>
+      </ResultCollector>
+      <hashTree/>
+      <ResultCollector guiclass="StatVisualizer" testclass="ResultCollector" testname="聚合报告" enabled="true">
+        <boolProp name="ResultCollector.error_logging">false</boolProp>
+        <objProp>
+          <name>saveConfig</name>
+          <value class="SampleSaveConfiguration">
+            <time>true</time>
+            <latency>true</latency>
+            <timestamp>true</timestamp>
+            <success>true</success>
+            <label>true</label>
+            <code>true</code>
+            <message>true</message>
+            <threadName>true</threadName>
+            <dataType>true</dataType>
+            <encoding>false</encoding>
+            <assertions>true</assertions>
+            <subresults>true</subresults>
+            <responseData>false</responseData>
+            <samplerData>false</samplerData>
+            <xml>false</xml>
+            <fieldNames>true</fieldNames>
+            <responseHeaders>false</responseHeaders>
+            <requestHeaders>false</requestHeaders>
+            <responseDataOnError>false</responseDataOnError>
+            <saveAssertionResultsFailureMessage>true</saveAssertionResultsFailureMessage>
+            <assertionsResultsToSave>0</assertionsResultsToSave>
+            <bytes>true</bytes>
+            <sentBytes>true</sentBytes>
+            <url>true</url>
+            <threadCounts>true</threadCounts>
+            <idleTime>true</idleTime>
+            <connectTime>true</connectTime>
+          </value>
+        </objProp>
+        <stringProp name="filename"></stringProp>
+      </ResultCollector>
+      <hashTree/>
+    </hashTree>
+  </hashTree>
+</jmeterTestPlan>

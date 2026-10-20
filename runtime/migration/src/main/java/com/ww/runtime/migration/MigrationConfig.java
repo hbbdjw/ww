@@ -7,25 +7,36 @@ package com.ww.runtime.migration;
  * @param maxBytesPerSecond  简单限流的目标速率（字节/秒，默认 64MB）
  * @param chunkSize          分片大小（字节，默认 4MB；限流睡眠时长按每片该大小估算）
  * @param ackWindow          传输 ack 窗口（在途未确认分片数，默认 8）
+ * @param partitionFreezeTtlMillis 迁移期源分区停写冻结 TTL（默认 5 分钟，期间按批续期；
+ *                                 执行节点崩溃后分区最多停写该时长，到期自动解除）
  */
 public record MigrationConfig(int maxConcurrentTasks,
                               long maxBytesPerSecond,
                               int chunkSize,
-                              int ackWindow) {
+                              int ackWindow,
+                              long partitionFreezeTtlMillis) {
 
     public static final int DEFAULT_MAX_CONCURRENT_TASKS = 2;
     public static final long DEFAULT_MAX_BYTES_PER_SECOND = 64L * 1024 * 1024;
     public static final int DEFAULT_CHUNK_SIZE = ChunkCodec.DEFAULT_CHUNK_SIZE;
     public static final int DEFAULT_ACK_WINDOW = 8;
+    public static final long DEFAULT_PARTITION_FREEZE_TTL_MILLIS = 5L * 60 * 1000;
 
-    public MigrationConfig {
-        validate(maxConcurrentTasks, maxBytesPerSecond, chunkSize, ackWindow);
+    public MigrationConfig(int maxConcurrentTasks, long maxBytesPerSecond,
+                           int chunkSize, int ackWindow) {
+        this(maxConcurrentTasks, maxBytesPerSecond, chunkSize, ackWindow,
+                DEFAULT_PARTITION_FREEZE_TTL_MILLIS);
     }
 
-    /** 默认配置：2 并发 / 64MBps / 4MB 分片 / ack 窗口 8。 */
+    public MigrationConfig {
+        validate(maxConcurrentTasks, maxBytesPerSecond, chunkSize, ackWindow,
+                partitionFreezeTtlMillis);
+    }
+
+    /** 默认配置：2 并发 / 64MBps / 4MB 分片 / ack 窗口 8 / 冻结 TTL 5 分钟。 */
     public static MigrationConfig defaults() {
         return new MigrationConfig(DEFAULT_MAX_CONCURRENT_TASKS, DEFAULT_MAX_BYTES_PER_SECOND,
-                DEFAULT_CHUNK_SIZE, DEFAULT_ACK_WINDOW);
+                DEFAULT_CHUNK_SIZE, DEFAULT_ACK_WINDOW, DEFAULT_PARTITION_FREEZE_TTL_MILLIS);
     }
 
     /**
@@ -42,7 +53,7 @@ public record MigrationConfig(int maxConcurrentTasks,
     }
 
     private static void validate(int maxConcurrentTasks, long maxBytesPerSecond,
-                                 int chunkSize, int ackWindow) {
+                                 int chunkSize, int ackWindow, long partitionFreezeTtlMillis) {
         if (maxConcurrentTasks <= 0) {
             throw new IllegalArgumentException("maxConcurrentTasks must be > 0, got " + maxConcurrentTasks);
         }
@@ -54,6 +65,10 @@ public record MigrationConfig(int maxConcurrentTasks,
         }
         if (ackWindow <= 0) {
             throw new IllegalArgumentException("ackWindow must be > 0, got " + ackWindow);
+        }
+        if (partitionFreezeTtlMillis <= 0) {
+            throw new IllegalArgumentException("partitionFreezeTtlMillis must be > 0, got "
+                    + partitionFreezeTtlMillis);
         }
     }
 }

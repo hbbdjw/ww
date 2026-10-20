@@ -14,18 +14,16 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
- * 缺陷复现：{@code NodeRuntime.start()} 启动失败时残留 JOINING 孤儿记录，
- * 且 {@code shutdown()} 因 {@code started=false} 拒绝执行任何清理。
+ * 深审缺陷 6（回归重建，§6.1）：{@code NodeRuntime.start()} 启动失败不得残留 JOINING 孤儿。
  *
- * <p>启动序列先 {@code registry.register(JOINING)} 再 {@code grpcHost.start(port)}；
- * 端口占用等绑定失败抛 IOException 后：</p>
- * <ol>
- *   <li>注册表中遗留 JOINING 行——心跳永不到来、无人推进状态；
- *       {@code listAlive()} 视其为存活节点，调度器会向它下发命令并等待一个
- *       永远不会就绪的节点（放置环可能把它算进去）；</li>
- *   <li>{@code started} 未置位 → {@code shutdown()} 提前返回，不做 tombstone，
- *       孤儿记录无法通过正常停机路径清理，只能人工改库或等外部故障检测。</li>
- * </ol>
+ * <p>启动序列先 {@code registry.register(JOINING)} 再 {@code grpcHost.start(port)}。
+ * 原缺陷：端口占用等绑定失败抛 IOException 后注册表残留 JOINING 记录，
+ * {@code listAlive()} 将其视为可用节点（写命令石沉大海、治愈永无休止），
+ * 且 {@code shutdown()} 在 {@code started=false} 时不清理。</p>
+ *
+ * <p>修复（§3.12④ 深审6内联回滚）：start 失败路径内联 {@code tombstone(self)} +
+ * 回收本路径启动的宿主；shutdown 仍无条件清理作二次兜底。
+ * 本测试断言修复后行为：start 失败后立即 DEAD、不在 listAlive。</p>
  */
 class NodeRuntimeStartFailureOrphanReproTest {
 
@@ -49,7 +47,7 @@ class NodeRuntimeStartFailureOrphanReproTest {
     }
 
     @Test
-    void startFailureLeavesJoiningOrphanThatShutdownCannotClean() throws IOException {
+    void startFailureTombstonesInlineNoJoiningOrphan() throws IOException {
         InMemoryNodeRegistry registry = new InMemoryNodeRegistry();
 
         // 占用一个真实端口，制造第二个 host 的绑定失败
@@ -58,23 +56,22 @@ class NodeRuntimeStartFailureOrphanReproTest {
         int occupiedPort = blocker.getPort();
 
         failingHost = new GrpcServerHost();
-        NodeRuntime runtime = new NodeRuntime(SELF, "localhost", occupiedPort, 1.0d,
+        NodeRuntime runtime = new NodeRuntime(SELF, "localhost", occupiedPort, 8080, 1.0d,
                 registry, failingHost, () -> snapshot(), SystemClock.instance(), 1_000L);
 
-        // 启动失败（端口占用）：register(JOINING) 已执行，host.start 抛 IOException
+        // 启动失败（端口占用）：异常照常上抛
         assertThatThrownBy(runtime::start).isInstanceOf(IOException.class);
 
-        // 孤儿记录：停留在 JOINING
+        // 修复断言：注册行内联 tombstone 为 DEAD，不残留 JOINING、不进伸缩视图
         assertThat(registry.get(SELF)).isPresent();
-        assertThat(registry.get(SELF).orElseThrow().state()).isEqualTo(NodeState.JOINING);
-        assertThat(registry.listAlive()).extracting(info -> info.id())
-                .as("JOINING 孤儿被 listAlive 视为可用节点").contains(SELF);
-
-        // 期望：启动失败路径或 shutdown() 应 tombstone 清理；
-        // 实际：shutdown 因 started=false 直接返回，JOINING 永久残留。
-        runtime.shutdown();
         assertThat(registry.get(SELF).orElseThrow().state())
-                .as("start 失败后 shutdown 未做任何清理：应 tombstone 为 DEAD，实际仍为 JOINING")
+                .as("start 失败必须内联回滚为 DEAD（不留 JOINING 孤儿）")
                 .isEqualTo(NodeState.DEAD);
+        assertThat(registry.listAlive()).extracting(info -> info.id())
+                .as("孤儿不得进入 listAlive 污染伸缩视图").doesNotContain(SELF);
+
+        // shutdown 二次调用幂等，且不复活记录
+        runtime.shutdown();
+        assertThat(registry.get(SELF).orElseThrow().state()).isEqualTo(NodeState.DEAD);
     }
 }

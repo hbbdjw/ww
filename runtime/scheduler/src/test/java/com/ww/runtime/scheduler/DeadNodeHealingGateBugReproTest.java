@@ -21,14 +21,13 @@ import java.util.Map;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * 缺陷复现：节点故障触发的分区「治愈」迁移被 {@code minMoveRatio} 扩容门控拦截。
+ * 验证故障节点分区的治愈迁移不受 {@code minMoveRatio} 扩容门控拦截。
  *
- * <p>{@code ReconcileLoop.reconcile} 的步骤 (f) 把「故障节点分区迁走」与「扩容重平衡」
- * 混在同一条路径上，共用 {@code RebalancePlanner.shouldRebalance} 门控
- * （移动比例 ≥ minMoveRatio 且过冷却期）。大集群下单节点故障只影响约 1/N 的分区，
- * N 较大时 1/N &lt; minMoveRatio（默认 0.10 → N ≥ 11 即触发），故障节点上的分区
- * <b>永远不会被迁走</b>：放置表持续指向 DEAD 节点，归属它的分区读写全部不可用，
- * 直到更多节点接连故障凑够比例——可用性缺陷。</p>
+ * <p>{@code ReconcileLoop.reconcile} 的步骤 (f) 中，「故障节点分区迁走」与「扩容重平衡」
+ * 是两条独立路径。大集群下单节点故障只影响约 1/N 的分区，
+ * N 较大时 1/N &lt; minMoveRatio（默认 0.10 → N ≥ 11 即触发）；
+ * 源节点已不在存活集合的分区绕过比例/冷却门控直接治愈
+ * （不迁 = 数据不可用），直至其分区不再指向 DEAD 节点。</p>
  */
 class DeadNodeHealingGateBugReproTest {
 

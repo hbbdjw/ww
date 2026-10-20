@@ -149,8 +149,10 @@ public final class StorageGrpcServer extends StorageGrpc.StorageImplBase {
 
     @Override
     public void replicateDelete(ObjectReqP request, StreamObserver<DeleteAckP> responseObserver) {
-        boolean deleted = capability.replicaDelete(request.getBucket(), request.getKey());
-        ack(responseObserver, true, deleted, null);
+        boolean deleted = capability.replicaDelete(request.getBucket(), request.getKey(),
+                request.getVersion());
+        ack(responseObserver, true, deleted, request.getVersion() > 0 ? null
+                : "versionless delete (legacy)");
     }
 
     // ------------------------------------------------------------------
@@ -208,6 +210,20 @@ public final class StorageGrpcServer extends StorageGrpc.StorageImplBase {
             responseObserver.onCompleted();
         } catch (RuntimeException e) {
             respondInternalError(responseObserver, "countObjects", bucket, e);
+        }
+    }
+
+    @Override
+    public void listBucketNames(com.ww.runtime.proto.BucketNameP request,
+                                StreamObserver<com.ww.runtime.proto.BucketNameP> responseObserver) {
+        try {
+            for (String name : capability.listBuckets()) {
+                responseObserver.onNext(com.ww.runtime.proto.BucketNameP.newBuilder()
+                        .setName(name).build());
+            }
+            responseObserver.onCompleted();
+        } catch (RuntimeException e) {
+            respondInternalError(responseObserver, "listBucketNames", "", e);
         }
     }
 
@@ -491,28 +507,58 @@ public final class StorageGrpcServer extends StorageGrpc.StorageImplBase {
                 responseObserver.onCompleted(); // 对象比 offset 短：空窗口
                 return;
             }
-            byte[] buf = new byte[chunkSize];
-            long pos = skipped;                 // 片在对象内的绝对偏移
-            long remaining = length > 0 ? length : Long.MAX_VALUE;
-            while (remaining > 0) {
-                int want = (int) Math.min(buf.length, remaining);
-                int n = in.readNBytes(buf, 0, want);
-                if (n <= 0) {
-                    break;
+            // T23：分片缓冲取自复用池（chunkOf 的 ByteString.copyFrom 已拷贝内容，
+            // 缓冲跨片安全复用；流结束归还），并发转发读不再每流新分配 4MB 堆数组
+            byte[] buf = borrowChunkBuffer();
+            try {
+                long pos = skipped;                 // 片在对象内的绝对偏移
+                long remaining = length > 0 ? length : Long.MAX_VALUE;
+                while (remaining > 0) {
+                    int want = (int) Math.min(buf.length, remaining);
+                    int n = in.readNBytes(buf, 0, want);
+                    if (n <= 0) {
+                        break;
+                    }
+                    boolean fin = n < want;          // 对象末尾或窗口末尾
+                    responseObserver.onNext(chunkOf(bucket, obj.meta, buf, n, pos, fin));
+                    pos += n;
+                    remaining -= n;
+                    if (fin) {
+                        break;
+                    }
                 }
-                boolean fin = n < want;          // 对象末尾或窗口末尾
-                responseObserver.onNext(chunkOf(bucket, obj.meta, buf, n, pos, fin));
-                pos += n;
-                remaining -= n;
-                if (fin) {
-                    break;
-                }
+            } finally {
+                returnChunkBuffer(buf);
             }
             responseObserver.onCompleted();
         } catch (IOException e) {
             respondInternalError(responseObserver, "forwardGet",
                     bucket + "/" + obj.meta.getKey(), e);
         }
+    }
+
+    /** T23：forwardGet 分片缓冲复用池（上限 16 块 ≈ chunkSize×16；空流归还超限时丢弃交由 GC）。 */
+    private final java.util.concurrent.ConcurrentLinkedDeque<byte[]> chunkBufPool =
+            new java.util.concurrent.ConcurrentLinkedDeque<>();
+    private final java.util.concurrent.atomic.AtomicInteger chunkBufCount =
+            new java.util.concurrent.atomic.AtomicInteger();
+    private static final int CHUNK_BUF_POOL_MAX = 16;
+
+    private byte[] borrowChunkBuffer() {
+        byte[] buf = chunkBufPool.pollFirst();
+        if (buf != null) {
+            chunkBufCount.decrementAndGet();
+            return buf;
+        }
+        return new byte[chunkSize];
+    }
+
+    private void returnChunkBuffer(byte[] buf) {
+        if (buf.length != chunkSize || chunkBufCount.get() >= CHUNK_BUF_POOL_MAX) {
+            return;
+        }
+        chunkBufCount.incrementAndGet();
+        chunkBufPool.offerLast(buf);
     }
 
     private ObjectChunkP chunkOf(String bucket, ObjectMetadata meta, byte[] buf, int n,

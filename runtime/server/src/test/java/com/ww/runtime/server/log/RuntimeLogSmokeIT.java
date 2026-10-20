@@ -45,7 +45,7 @@ class RuntimeLogSmokeIT {
 
     private static LogRecord record(String level, String logger, String message,
                                     String node, String stack, long ts) {
-        return new LogRecord(level, logger, "thread-1", message, stack, node, ts);
+        return new LogRecord(null, level, logger, "thread-1", message, stack, node, ts);
     }
 
     @Test

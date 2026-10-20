@@ -51,9 +51,8 @@ public final class CapabilitySchema {
 
     /**
      * 去除 {@code --} 行注释后按分号拆分，忽略空白片段（与 ClusterSchema 同口径）。
-     * 修复说明：原先直接按分号拆分并跳过以 "--" 开头的片段——而 rt_capability.sql
-     * 首行即行注释，唯一语句片段整体被跳过，真实 PG 上建不出 rt_capability_state
-     * （Testcontainers 冒烟 IT 暴露）。
+     * 逐行剥离行注释而非跳过以 "--" 开头的片段，保证注释行（如 DDL 首行注释）
+     * 不会吞掉其后跟随的语句。
      */
     private static List<String> splitStatements(String sql) {
         StringBuilder noComments = new StringBuilder(sql.length());

@@ -35,6 +35,9 @@ public final class JdbcCapabilityStateStore implements CapabilityStateStore {
             "SELECT node_id, capability, desired, actual, updated_at"
                     + " FROM rt_capability_state ORDER BY node_id, capability";
 
+    private static final String DELETE_BY_NODE =
+            "DELETE FROM rt_capability_state WHERE node_id = ?";
+
     private static final String UPSERT_DESIRED =
             "INSERT INTO rt_capability_state (node_id, capability, desired, actual, updated_at)"
                     + " VALUES (?, ?, ?, 'DISABLED', ?)"
@@ -98,6 +101,18 @@ public final class JdbcCapabilityStateStore implements CapabilityStateStore {
             return List.copyOf(result);
         } catch (SQLException e) {
             throw new RuntimeFrameworkException("failed to list capability states", e);
+        }
+    }
+
+    @Override
+    public void delete(NodeId node) {
+        java.util.Objects.requireNonNull(node, "node");
+        try (Connection connection = dataSource.getConnection();
+             PreparedStatement statement = connection.prepareStatement(DELETE_BY_NODE)) {
+            statement.setString(1, node.value());
+            statement.executeUpdate();
+        } catch (SQLException e) {
+            throw new RuntimeFrameworkException("failed to delete capability states for node: " + node, e);
         }
     }
 

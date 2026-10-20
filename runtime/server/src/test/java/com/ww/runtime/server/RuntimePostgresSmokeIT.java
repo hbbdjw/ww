@@ -5,6 +5,11 @@ import com.ww.runtime.capability.CapabilityStateStore.CapabilityRecord;
 import com.ww.runtime.capability.JdbcCapabilityStateStore;
 import com.ww.runtime.cluster.ClusterSchema;
 import com.ww.runtime.cluster.JdbcNodeRegistry;
+import com.ww.runtime.lb.JdbcLbConfigStore;
+import com.ww.runtime.lb.LbConfig;
+import com.ww.runtime.lb.LbConfigConflictException;
+import com.ww.runtime.lb.LbSchema;
+import com.ww.runtime.lb.LbStrategy;
 import com.ww.runtime.common.CapabilityState;
 import com.ww.runtime.common.CapabilityType;
 import com.ww.runtime.common.NodeId;
@@ -20,6 +25,9 @@ import com.ww.runtime.placement.PlacementNode;
 import com.ww.runtime.placement.PlacementSchema;
 import com.ww.runtime.scheduler.JdbcLeaseStore;
 import com.ww.runtime.scheduler.SchedulerSchema;
+import com.ww.runtime.server.security.JdbcRbacStore;
+import com.ww.runtime.server.security.RbacSchema;
+import com.ww.runtime.server.security.RbacStore;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
@@ -74,6 +82,8 @@ class RuntimePostgresSmokeIT {
         PlacementSchema.bootstrap(dataSource);
         SchedulerSchema.bootstrap(dataSource);
         MigrationSchema.bootstrap(dataSource);
+        RbacSchema.bootstrap(dataSource);
+        LbSchema.bootstrap(dataSource);
     }
 
     /** ① 5 个 Schema.bootstrap（重复执行验证幂等）后 6 张表全部存在于 public schema。 */
@@ -85,6 +95,8 @@ class RuntimePostgresSmokeIT {
         PlacementSchema.bootstrap(dataSource);
         SchedulerSchema.bootstrap(dataSource);
         MigrationSchema.bootstrap(dataSource);
+        RbacSchema.bootstrap(dataSource);
+        LbSchema.bootstrap(dataSource);
 
         Set<String> tables = new HashSet<>();
         try (Connection conn = dataSource.getConnection();
@@ -100,16 +112,82 @@ class RuntimePostgresSmokeIT {
                 "rt_cluster_config",
                 "rt_capability_state",
                 "rt_partition_placement",
+                "rt_placement_revision",
                 "rt_scheduler_lease",
-                "rt_migration_task");
+                "rt_migration_task",
+                "sys_dept",
+                "sys_user",
+                "sys_role",
+                "sys_menu",
+                "sys_user_role",
+                "sys_role_menu",
+                "rt_lb_config");
+
+        // rt_node 幂等加列 http_port 必须存在（旧库 ALTER 升级路径）
+        Set<String> nodeColumns = new HashSet<>();
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(
+                     "SELECT column_name FROM information_schema.columns "
+                             + "WHERE table_schema='public' AND table_name='rt_node'");
+             ResultSet rs = ps.executeQuery()) {
+            while (rs.next()) {
+                nodeColumns.add(rs.getString(1));
+            }
+        }
+        assertThat(nodeColumns).contains("http_port");
+
+        Set<String> placementColumns = new HashSet<>();
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(
+                     "SELECT column_name FROM information_schema.columns "
+                             + "WHERE table_schema='public' AND table_name='rt_partition_placement'");
+             ResultSet rs = ps.executeQuery()) {
+            while (rs.next()) {
+                placementColumns.add(rs.getString(1));
+            }
+        }
+        assertThat(placementColumns).contains("lease_until_ms", "valid_after_ms");
     }
 
-    /** ② JdbcNodeRegistry：register（JOINING/epoch=0）→ markState ACTIVE → get 断言。 */
+    /** ⑥ JdbcRbacStore：部门/角色/菜单/用户 + 关系绑定往返，loadPermissions 聚合权限标识。 */
+    @Test
+    void rbacStoreRelationRoundTripAndPermissions() {
+        JdbcRbacStore rbac = new JdbcRbacStore(dataSource);
+        long now = System.currentTimeMillis();
+
+        long deptId = rbac.createDept(new RbacStore.Dept(0, 0L, "冒烟公司", 0,
+                null, null, 1, now, now));
+        long roleId = rbac.createRole(new RbacStore.Role(0, "管理员", "rbac_admin",
+                0, 1, 1, null, now, now));
+        long menuId = rbac.createMenu(new RbacStore.Menu(0, 0L, "用户管理", "C",
+                null, "system:user:list", null, 1, 1, 1));
+        long buttonId = rbac.createMenu(new RbacStore.Menu(0, 0L, "新增", "F",
+                null, "system:user:add", null, 2, 1, 1));
+
+        String encoded = new org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder()
+                .encode("pass123");
+        long userId = rbac.createUser(new RbacStore.UserAccount(0, deptId, "smoke_user",
+                "冒烟用户", encoded, null, null, 0, 1, null, null, now, now));
+
+        rbac.bindRoleMenus(roleId, List.of(menuId, buttonId));
+        rbac.bindUserRoles(userId, List.of(roleId));
+
+        assertThat(rbac.findUserByUsername("smoke_user")).isPresent();
+        assertThat(rbac.findRoleIdsByUser(userId)).containsExactly(roleId);
+        assertThat(rbac.findMenuIdsByRole(roleId)).containsExactlyInAnyOrder(menuId, buttonId);
+        assertThat(rbac.findUserIdsByRole(roleId)).containsExactly(userId);
+
+        RbacStore.UserPermissions permissions = rbac.loadPermissions(userId);
+        assertThat(permissions.roleKeys()).containsExactly("rbac_admin");
+        assertThat(permissions.perms()).containsExactlyInAnyOrder("system:user:list", "system:user:add");
+    }
+
+    /** ② JdbcNodeRegistry：register（JOINING/epoch=0）→ markState ACTIVE → get 断言；httpPort 往返。 */
     @Test
     void nodeRegistryRegisterMarkStateActiveAndGet() {
         JdbcNodeRegistry registry = new JdbcNodeRegistry(dataSource);
         NodeId id = NodeId.of("smoke-node-1");
-        registry.register(NodeInfo.of(id, "localhost", 9101, NodeState.JOINING, 0L, 1.0,
+        registry.register(NodeInfo.of(id, "localhost", 9101, 8091, NodeState.JOINING, 0L, 1.0,
                 ResourceSnapshot.of(1.5, 100L, 50L, 1_000L, 500L, 1L)));
 
         registry.markState(id, NodeState.ACTIVE);
@@ -121,6 +199,7 @@ class RuntimePostgresSmokeIT {
         assertThat(loaded.get().stateEpoch()).isEqualTo(1L); // register 置 0，markState 乐观锁 +1
         assertThat(loaded.get().host()).isEqualTo("localhost");
         assertThat(loaded.get().grpcPort()).isEqualTo(9101);
+        assertThat(loaded.get().httpPort()).isEqualTo(8091); // LB 反代寻址端口随注册往返
         assertThat(loaded.get().weight()).isEqualTo(1.0);
     }
 
@@ -180,6 +259,33 @@ class RuntimePostgresSmokeIT {
                 .isFalse();
     }
 
+    /** ④b 放置修订号 + 租约：续约 SQL 生效，切主后旧属主续约失败且新属主带 validAfter 屏障。 */
+    @Test
+    void placementRevisionLeaseRenewalAndCutoverBarrier() {
+        JdbcPlacementStore store = new JdbcPlacementStore(dataSource);
+        NodeId n1 = NodeId.of("lease-node-1");
+        NodeId n2 = NodeId.of("lease-node-2");
+        store.replaceAll("LEASE", List.of(new Placement(0, n1, PlacementRole.PRIMARY, 0L)));
+        long replaceRevision = store.revision("LEASE");
+        assertThat(replaceRevision).isGreaterThan(0L);
+
+        assertThat(store.renewLeases("LEASE", List.of(0), n1, 0L, 5_000L))
+                .containsKey(0);
+
+        assertThat(store.cutover("LEASE", 0, n2, 0L)).isTrue();
+        assertThat(store.revision("LEASE")).isGreaterThan(replaceRevision);
+        assertThat(store.get("LEASE", 0)).hasValueSatisfying(placement -> {
+            assertThat(placement.node()).isEqualTo(n2);
+            assertThat(placement.epoch()).isEqualTo(1L);
+            assertThat(placement.validAfterMs())
+                    .as("旧属主存在活动租约切主时必须设置新属主等待屏障")
+                    .isGreaterThan(0L);
+        });
+        assertThat(store.renewLeases("LEASE", List.of(0), n1, 0L, 5_000L))
+                .as("切主后旧属主续约必须失败")
+                .isEmpty();
+    }
+
     /** ⑤ JdbcCapabilityStateStore：setDesired/setActual 写入后 get 往返一致。 */
     @Test
     void capabilityStateStoreDesiredActualRoundTrip() {
@@ -199,5 +305,34 @@ class RuntimePostgresSmokeIT {
         store.setDesired(node, CapabilityType.MOCK, CapabilityState.DISABLED);
         assertThat(store.get(node, CapabilityType.MOCK))
                 .hasValueSatisfying(r -> assertThat(r.desired()).isEqualTo(CapabilityState.DISABLED));
+    }
+
+    /** ⑦ JdbcLbConfigStore：缺行播种默认配置 → CAS 更新成功且 version+1 → 旧版本冲突 409。 */
+    @Test
+    void lbConfigStoreSeedUpdateAndCasConflict() {
+        JdbcLbConfigStore store = new JdbcLbConfigStore(dataSource);
+
+        LbConfig seeded = store.get();
+        assertThat(seeded.enabled()).isFalse();
+        assertThat(seeded.pathPrefixes()).containsExactly("/cache/**", "/storage/**");
+        long seedVersion = seeded.version();
+
+        LbConfig enabled = new LbConfig(true, "smoke-node-1", LbStrategy.WEIGHTED, false,
+                seeded.pathPrefixes(), java.util.Map.of("smoke-node-2", 3.0),
+                seeded.configRefreshMs(), seeded.nodeViewRefreshMs(),
+                seeded.connectTimeoutMs(), seeded.requestTimeoutMs(), seedVersion);
+        LbConfig updated = store.update(enabled, seedVersion);
+        assertThat(updated.version()).isEqualTo(seedVersion + 1);
+        assertThat(updated.enabled()).isTrue();
+        assertThat(updated.strategy()).isEqualTo(LbStrategy.WEIGHTED);
+        assertThat(updated.selfServe()).isFalse();
+        assertThat(updated.weightOverrides()).containsEntry("smoke-node-2", 3.0);
+
+        // 另一实例读到新版本
+        assertThat(new JdbcLbConfigStore(dataSource).get().version()).isEqualTo(seedVersion + 1);
+
+        // 用过期版本更新必须冲突
+        org.junit.jupiter.api.Assertions.assertThrows(LbConfigConflictException.class,
+                () -> store.update(enabled, seedVersion));
     }
 }

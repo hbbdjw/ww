@@ -19,7 +19,7 @@ class NodeStateMachineTest {
             NodeState.ACTIVE, Set.of(NodeState.SUSPECTED, NodeState.LEAVING, NodeState.DEAD),
             NodeState.SUSPECTED, Set.of(NodeState.ACTIVE, NodeState.DEAD),
             NodeState.LEAVING, Set.of(NodeState.DEAD),
-            NodeState.DEAD, Set.of());
+            NodeState.DEAD, Set.of(NodeState.JOINING));
 
     @Test
     void legalTransitionsPass() {
@@ -44,13 +44,20 @@ class NodeStateMachineTest {
                         .hasMessageContaining(from + " -> " + to);
             }
         }
-        // 25 种组合 - 8 种合法（2+3+2+1+0）= 17 种非法，确保矩阵被完整遍历
-        assertThat(illegal).isEqualTo(17);
+        // 25 种组合 - 9 种合法（2+3+2+1+1）= 16 种非法，确保矩阵被完整遍历
+        assertThat(illegal).isEqualTo(16);
     }
 
     @Test
-    void deadIsTerminal() {
+    void deadOnlyRejoinsViaJoining() {
+        // DEAD 节点复活仅允许经重新注册（DEAD→JOINING），禁止直接 DEAD→ACTIVE 等捷径
+        assertThatCode(() -> NodeStateMachine.check(NodeState.DEAD, NodeState.JOINING))
+                .as("check(DEAD, JOINING) should be legal")
+                .doesNotThrowAnyException();
         for (NodeState to : NodeState.values()) {
+            if (to == NodeState.JOINING) {
+                continue;
+            }
             assertThatThrownBy(() -> NodeStateMachine.check(NodeState.DEAD, to))
                     .isInstanceOf(IllegalStateTransitionException.class);
         }

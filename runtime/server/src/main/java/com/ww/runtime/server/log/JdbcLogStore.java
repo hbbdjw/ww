@@ -85,6 +85,7 @@ public final class JdbcLogStore {
                 List<LogRecord> result = new ArrayList<>();
                 while (rs.next()) {
                     result.add(new LogRecord(
+                            rs.getLong("id"),
                             rs.getString("level"),
                             rs.getString("logger_name"),
                             rs.getString("thread_name"),
@@ -97,6 +98,75 @@ public final class JdbcLogStore {
             }
         } catch (SQLException e) {
             throw new RuntimeFrameworkException("rt_log page query failed: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Keyset 分页：取严格早于 (beforeTs, beforeId) 的记录，排序与 {@link #page} 一致。
+     *
+     * @param level    级别过滤（可空）
+     * @param node     节点过滤（可空）
+     * @param keyword  关键字过滤（可空）
+     * @param beforeTs 游标时间戳（exclusive）
+     * @param beforeId 游标 id（exclusive，同时间戳时的 tiebreak）
+     * @param limit    页大小（>=1）
+     */
+    public List<LogRecord> pageBefore(String level, String node, String keyword,
+                                      long beforeTs, long beforeId, int limit) {
+        StringBuilder sql = new StringBuilder("SELECT ").append(SELECT_COLUMNS)
+                .append(" FROM rt_log");
+        List<Object> params = new ArrayList<>();
+        List<String> conditions = new ArrayList<>();
+
+        if (level != null && !level.isBlank()) {
+            conditions.add("LOWER(level) = ?");
+            params.add(level.trim().toLowerCase(Locale.ROOT));
+        }
+        if (node != null && !node.isBlank()) {
+            conditions.add("node = ?");
+            params.add(node.trim());
+        }
+        if (keyword != null && !keyword.isBlank()) {
+            String like = "%" + keyword.trim().toLowerCase(Locale.ROOT) + "%";
+            conditions.add("(LOWER(message) LIKE ? OR LOWER(logger_name) LIKE ?"
+                    + " OR LOWER(node) LIKE ? OR LOWER(stack_trace) LIKE ?)");
+            params.add(like);
+            params.add(like);
+            params.add(like);
+            params.add(like);
+        }
+        conditions.add("(created_at < ? OR (created_at = ? AND id < ?))");
+        params.add(beforeTs);
+        params.add(beforeTs);
+        params.add(beforeId);
+
+        sql.append(" WHERE ").append(String.join(" AND ", conditions));
+        sql.append(" ORDER BY created_at DESC, id DESC LIMIT ?");
+
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql.toString())) {
+            int idx = 1;
+            for (Object param : params) {
+                ps.setObject(idx++, param);
+            }
+            ps.setInt(idx, Math.max(1, limit));
+            try (ResultSet rs = ps.executeQuery()) {
+                List<LogRecord> result = new ArrayList<>();
+                while (rs.next()) {
+                    result.add(new LogRecord(
+                            rs.getLong("id"),
+                            rs.getString("level"),
+                            rs.getString("logger_name"),
+                            rs.getString("thread_name"),
+                            rs.getString("message"),
+                            rs.getString("stack_trace"),
+                            rs.getString("node"),
+                            rs.getLong("created_at")));
+                }
+                return result;
+            }
+        } catch (SQLException e) {
+            throw new RuntimeFrameworkException("rt_log pageBefore query failed: " + e.getMessage(), e);
         }
     }
 
@@ -115,6 +185,19 @@ public final class JdbcLogStore {
             }
         } catch (SQLException e) {
             throw new RuntimeFrameworkException("rt_log count query failed: " + e.getMessage(), e);
+        }
+    }
+
+    /** 按时间范围删除日志（fromTs 含，toTs 不含）。返回删除行数。 */
+    public int deleteByDateRange(long fromTs, long toTs) {
+        String sql = "DELETE FROM rt_log WHERE created_at >= ? AND created_at < ?";
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setLong(1, fromTs);
+            ps.setLong(2, toTs);
+            return ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new RuntimeFrameworkException("rt_log delete by date range failed: " + e.getMessage(), e);
         }
     }
 

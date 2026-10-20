@@ -44,4 +44,9 @@ final class FlakyCapabilityStore implements CapabilityStateStore {
         }
         return delegate.list();
     }
+
+    @Override
+    public void delete(NodeId node) {
+        delegate.delete(node);
+    }
 }

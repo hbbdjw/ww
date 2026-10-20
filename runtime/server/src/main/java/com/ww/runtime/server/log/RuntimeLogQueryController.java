@@ -3,6 +3,7 @@ package com.ww.runtime.server.log;
 import com.ww.runtime.log.LogRecord;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
@@ -32,25 +33,46 @@ public class RuntimeLogQueryController {
     /**
      * 分页查询（按时间倒序）。
      *
-     * @param level   级别过滤（可空）
-     * @param node    节点过滤（可空）
-     * @param keyword 关键字过滤（可空，四字段匹配）
-     * @param page    页码（从 1 起，默认 1）
-     * @param size    页大小（默认 50，上限 500）
+     * <p>两种模式：</p>
+     * <ul>
+     *   <li>offset 模式（默认）：{@code page/size} 参数，返回 {@code {total, page, size, logs}}</li>
+     *   <li>cursor 模式：{@code beforeTs/beforeId} 参数，返回 {@code {logs, hasMore}}，不执行 count</li>
+     * </ul>
+     *
+     * @param level    级别过滤（可空）
+     * @param node     节点过滤（可空）
+     * @param keyword  关键字过滤（可空，四字段匹配）
+     * @param page     页码（offset 模式，从 1 起，默认 1）
+     * @param size     页大小（默认 50，上限 500）
+     * @param beforeTs cursor 模式游标时间戳（exclusive）
+     * @param beforeId cursor 模式游标 id（exclusive）
      */
     @GetMapping
     public ResponseEntity<Object> query(@RequestParam(required = false) String level,
                                         @RequestParam(required = false) String node,
                                         @RequestParam(required = false) String keyword,
                                         @RequestParam(defaultValue = "1") int page,
-                                        @RequestParam(defaultValue = "50") int size) {
+                                        @RequestParam(defaultValue = "50") int size,
+                                        @RequestParam(required = false) Long beforeTs,
+                                        @RequestParam(required = false) Long beforeId) {
         JdbcLogStore store = resolveStore();
         if (store == null) {
             return ResponseEntity.status(503)
                     .body(Map.of("message", "log persistence disabled (runtime.store=memory)"));
         }
-        int safePage = Math.max(1, page);
         int safeSize = Math.max(1, Math.min(500, size));
+
+        if (beforeTs != null && beforeId != null) {
+            List<LogRecord> fetched = store.pageBefore(level, node, keyword, beforeTs, beforeId, safeSize + 1);
+            boolean hasMore = fetched.size() > safeSize;
+            List<LogRecord> logs = hasMore ? fetched.subList(0, safeSize) : fetched;
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("logs", logs);
+            body.put("hasMore", hasMore);
+            return ResponseEntity.ok(body);
+        }
+
+        int safePage = Math.max(1, page);
         long total = store.count(level, node, keyword);
         List<LogRecord> logs = store.page(level, node, keyword, (safePage - 1) * safeSize, safeSize);
         Map<String, Object> body = new LinkedHashMap<>();
@@ -59,6 +81,28 @@ public class RuntimeLogQueryController {
         body.put("size", safeSize);
         body.put("logs", logs);
         return ResponseEntity.ok(body);
+    }
+
+    /**
+     * 按时间范围清除日志。
+     *
+     * @param fromTs 起始时间戳（epoch 毫秒，含）
+     * @param toTs   结束时间戳（epoch 毫秒，不含）
+     */
+    @DeleteMapping
+    public ResponseEntity<Object> deleteByDateRange(@RequestParam Long fromTs,
+                                                    @RequestParam Long toTs) {
+        JdbcLogStore store = resolveStore();
+        if (store == null) {
+            return ResponseEntity.status(503)
+                    .body(Map.of("message", "log persistence disabled (runtime.store=memory)"));
+        }
+        if (fromTs >= toTs) {
+            return ResponseEntity.badRequest()
+                    .body(Map.of("message", "fromTs must be earlier than toTs"));
+        }
+        int deleted = store.deleteByDateRange(fromTs, toTs);
+        return ResponseEntity.ok(Map.of("deleted", deleted));
     }
 
     private JdbcLogStore resolveStore() {

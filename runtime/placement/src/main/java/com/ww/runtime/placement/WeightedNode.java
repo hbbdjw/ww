@@ -13,4 +13,12 @@ public interface WeightedNode {
 
     /** 容量权重，越大期望分到的分区越多；约定 &gt; 0。 */
     double weight();
+
+    /**
+     * 故障域（机架/可用区/主机组）；空串表示未配置。
+     * 副本选择优先落在不同故障域，避免整机架断电同时丢失主备。
+     */
+    default String zone() {
+        return "";
+    }
 }

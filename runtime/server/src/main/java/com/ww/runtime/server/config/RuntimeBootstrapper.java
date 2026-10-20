@@ -28,6 +28,8 @@ import com.ww.runtime.server.grpc.ClusterControlServer;
 import com.ww.runtime.server.grpc.HealthServer;
 import com.ww.runtime.server.log.LogSchema;
 import com.ww.runtime.server.log.LogStreamGrpcServer;
+import com.ww.runtime.server.security.RbacSchema;
+import com.ww.runtime.server.security.RbacSeeder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
@@ -97,10 +99,19 @@ public final class RuntimeBootstrapper implements SmartLifecycle {
     private final MockCapability mockCapability;
     private final CacheCapability cacheCapability;
     private final StorageCapability storageCapability;
+    private final com.ww.runtime.data.cache.CacheGrpcServer cacheGrpcServer;
+    private final com.ww.runtime.data.cache.CacheGrpcClient cacheGrpcClient;
+    private final com.ww.runtime.data.storage.StorageGrpcServer storageGrpcServer;
+    private final com.ww.runtime.data.storage.StorageReplicator storageReplicator;
+    private final com.ww.runtime.data.storage.StorageGrpcClient storageGrpcClient;
     private final DesiredStateWriter desiredStateWriter;
     private final GrpcNodeCommandChannel grpcCommandChannel;
     private final MigrationEngine migrationEngine;
     private final ReconcileLoop reconcileLoop;
+    private final com.ww.runtime.server.cache.PartitionSweeper partitionSweeper;
+    private final com.ww.runtime.migration.RoutingPartitionAdapter routingPartitionAdapter;
+    private final RbacSeeder rbacSeeder;
+    private final com.ww.runtime.server.lb.LbRefresher lbRefresher;
 
     private volatile boolean running;
 
@@ -119,10 +130,19 @@ public final class RuntimeBootstrapper implements SmartLifecycle {
                                MockCapability mockCapability,
                                CacheCapability cacheCapability,
                                StorageCapability storageCapability,
+                               com.ww.runtime.data.cache.CacheGrpcServer cacheGrpcServer,
+                               com.ww.runtime.data.cache.CacheGrpcClient cacheGrpcClient,
+                               com.ww.runtime.data.storage.StorageGrpcServer storageGrpcServer,
+                               com.ww.runtime.data.storage.StorageReplicator storageReplicator,
+                               com.ww.runtime.data.storage.StorageGrpcClient storageGrpcClient,
                                DesiredStateWriter desiredStateWriter,
                                GrpcNodeCommandChannel grpcCommandChannel,
                                MigrationEngine migrationEngine,
-                               ReconcileLoop reconcileLoop) {
+                               ReconcileLoop reconcileLoop,
+                               com.ww.runtime.server.cache.PartitionSweeper partitionSweeper,
+                               com.ww.runtime.migration.RoutingPartitionAdapter routingPartitionAdapter,
+                               RbacSeeder rbacSeeder,
+                               com.ww.runtime.server.lb.LbRefresher lbRefresher) {
         this.dataSource = dataSource;
         this.props = props;
         this.self = self;
@@ -138,10 +158,19 @@ public final class RuntimeBootstrapper implements SmartLifecycle {
         this.mockCapability = mockCapability;
         this.cacheCapability = cacheCapability;
         this.storageCapability = storageCapability;
+        this.cacheGrpcServer = cacheGrpcServer;
+        this.cacheGrpcClient = cacheGrpcClient;
+        this.storageGrpcServer = storageGrpcServer;
+        this.storageReplicator = storageReplicator;
+        this.storageGrpcClient = storageGrpcClient;
         this.desiredStateWriter = desiredStateWriter;
         this.grpcCommandChannel = grpcCommandChannel;
         this.migrationEngine = migrationEngine;
         this.reconcileLoop = reconcileLoop;
+        this.partitionSweeper = partitionSweeper;
+        this.routingPartitionAdapter = routingPartitionAdapter;
+        this.rbacSeeder = rbacSeeder;
+        this.lbRefresher = lbRefresher;
     }
 
     @Override
@@ -160,6 +189,8 @@ public final class RuntimeBootstrapper implements SmartLifecycle {
         grpcHost.addService(clusterControlServer);
         grpcHost.addService(healthServer);
         grpcHost.addService(logStreamGrpcServer);
+        grpcHost.addService(storageGrpcServer);
+        grpcHost.addService(cacheGrpcServer);
 
         // (3) membership 先于 host.start：其 start() 内部 addService，
         //     而 NodeRuntime.start()（第 4 步）会启动 host，二者顺序不可交换。
@@ -168,23 +199,46 @@ public final class RuntimeBootstrapper implements SmartLifecycle {
         // (4) 注册 JOINING → host 绑定端口（支持随机端口）→ ACTIVE → 心跳线程
         try {
             nodeRuntime.start();
-        } catch (java.io.IOException e) {
+        } catch (java.io.IOException | RuntimeException e) {
+            // 深审6 失败路径清理：NodeRuntime.start 内部已 tombstone 自身注册行
+            // 并回收宿主；membership 心跳已先启动，一并停掉避免向已死宿主继续发包
+            try {
+                membershipService.stop();
+            } catch (RuntimeException cleanup) {
+                e.addSuppressed(cleanup);
+            }
             throw new IllegalStateException("node runtime failed to start: " + self, e);
         }
 
-        // (5) 注册能力模块 + 可选自动写期望态（此时本节点已 ACTIVE，调度器可拉起）
-        capabilityManager.register(mockCapability);
+        // (4.5) LB 配置/节点视图刷新守护：注册表已含本节点 ACTIVE 行，立即加载配置并周期轮询。
+        //       默认 enabled=false，启动本身不改变任何数据面行为。
+        lbRefresher.start();
+
+        // (5) 注册能力模块 + 初始期望态（仅首启写 env 值——已有记录=管理面已显式设置，
+        //     env 不覆盖，否则「UI 禁用节点 → 重启被 env 复活」破坏期望态持久化语义）。
+        //     注意：setInitialDesired 必须先于 register（register 会为无记录能力创建
+        //     DISABLED 记录，先行则首启判断永远失效）。
         if (props.capabilities().mockDesired()) {
-            desiredStateWriter.setDesired(self, CapabilityType.MOCK, CapabilityState.ACTIVE);
+            desiredStateWriter.setInitialDesired(self, CapabilityType.MOCK, CapabilityState.ACTIVE);
+        }
+        capabilityManager.register(mockCapability);
+        if (props.capabilities().cacheDesired()) {
+            desiredStateWriter.setInitialDesired(self, CapabilityType.CACHE, CapabilityState.ACTIVE);
         }
         capabilityManager.register(cacheCapability);
-        if (props.capabilities().cacheDesired()) {
-            desiredStateWriter.setDesired(self, CapabilityType.CACHE, CapabilityState.ACTIVE);
+        if (props.capabilities().storageDesired()) {
+            desiredStateWriter.setInitialDesired(self, CapabilityType.STORAGE, CapabilityState.ACTIVE);
         }
         capabilityManager.register(storageCapability);
-        if (props.capabilities().storageDesired()) {
-            desiredStateWriter.setDesired(self, CapabilityType.STORAGE, CapabilityState.ACTIVE);
-        }
+
+        // (5.2) 副本复制器：主写/主删成功钩子 + 后台补偿（backlog 重放/周期对账）
+        storageCapability.setWriteHook(storageReplicator);
+        storageReplicator.start();
+        // P1-3：freeze(true) 前先排空复制 backlog（在途 + 退避条目），
+        // 确保随后的副本提升/缩容排空不会提升一个落后于主节点的副本。
+        // 3s < gRPC 命令 deadline(5s)：超时未排空也不阻断冻结（安全方向），下轮续跑。
+        capabilityManager.setFreezeHook(CapabilityType.STORAGE,
+                () -> storageReplicator.awaitDrained(3_000L));
 
         // (5.5) 本地能力自收敛：desired=ACTIVE 而 actual=DISABLED 的能力同步拉起（convergeStart 幂等）。
         // 否则非 leader 节点在 (7) resumeAll 跑遗留迁移任务时会先于 leader 的 start 命令
@@ -210,6 +264,10 @@ public final class RuntimeBootstrapper implements SmartLifecycle {
         boolean leader = reconcileLoop.runOnce();
         reconcileLoop.start();
 
+        // (6.5) 启动清扫：放置表已引导、在途任务可见——裁剪 AOF 回放出的旧归属数据
+        //      （含 clearPartition 失败的兜底）。FAILED 任务分区保留（resumeAll 断点续跑依赖）。
+        partitionSweeper.sweepAll();
+
         // (7) 断点续跑未完成迁移任务
         migrationEngine.resumeAll();
 
@@ -226,7 +284,14 @@ public final class RuntimeBootstrapper implements SmartLifecycle {
         running = false;
         LOG.info("runtime-server stopping: nodeId={}", self);
 
+        lbRefresher.stop(); // 最先停：停机过程中不再分发到正在退出的节点
         reconcileLoop.stop();
+        storageReplicator.stop();
+        storageGrpcServer.close();
+        storageGrpcClient.close();
+        cacheGrpcServer.close();
+        cacheGrpcClient.close();
+        routingPartitionAdapter.close();
         membershipService.stop();
         grpcCommandChannel.close();
         nodeRuntime.shutdown(); // LEAVING → 停心跳 → host.stop → tombstone DEAD
@@ -245,10 +310,12 @@ public final class RuntimeBootstrapper implements SmartLifecycle {
         return Integer.MAX_VALUE;
     }
 
-    /** 启动自检：store 模式日志；jdbc 模式 PG SELECT 1 可达性检查 + 5 个 Schema bootstrap。 */
+    /** 启动自检：store 模式日志；jdbc 模式 PG SELECT 1 可达性检查 + Schema bootstrap + RBAC 播种。 */
     private void bootstrapStore() {
         if ("memory".equals(props.store())) {
             LOG.info("store=memory: in-memory repositories, schema bootstrap and PG self-check skipped");
+            rbacSeeder.seedIfEmpty();
+            rbacSeeder.ensureLatestMenus();
             return;
         }
         DataSource ds = dataSource.getObject();
@@ -256,10 +323,19 @@ public final class RuntimeBootstrapper implements SmartLifecycle {
         ClusterSchema.bootstrap(ds);
         CapabilitySchema.bootstrap(ds);
         PlacementSchema.bootstrap(ds);
+        com.ww.runtime.placement.DegradedPartitionSchema.bootstrap(ds); // P0-2 隔离注册表
         SchedulerSchema.bootstrap(ds);
         MigrationSchema.bootstrap(ds);
         LogSchema.bootstrap(ds);
-        LOG.info("DDL bootstrap completed (cluster/capability/placement/scheduler/migration/log)");
+        RbacSchema.bootstrap(ds);
+        com.ww.runtime.lb.LbSchema.bootstrap(ds);
+        LOG.info("DDL bootstrap completed (cluster/capability/placement/degraded/scheduler/migration/log/rbac/lb)");
+        // 跨节点互斥播种：多节点同时首启时避免并发插入 admin/超管角色撞唯一约束导致启动失败；
+        // 增量菜单补齐同处互斥区（sys_menu.path 无唯一约束，防止多节点并发插入重复菜单）
+        RbacSchema.seedExclusively(ds, () -> {
+            rbacSeeder.seedIfEmpty();
+            rbacSeeder.ensureLatestMenus();
+        });
     }
 
     private void pgSelfCheck(DataSource ds) {

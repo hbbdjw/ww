@@ -17,8 +17,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * JdbcMigrationTaskStore 无真实数据库环境下的基础行为：SQLException 一律包装为
- * MigrationException（真实建表/读写路径依赖 PostgreSQL，按任务要求以编译通过 +
- * 异常包装为准，不做集成测试）。
+ * MigrationException（真实建表/读写路径依赖 PostgreSQL，由集成测试覆盖）。
  */
 class JdbcMigrationTaskStoreTest {
 

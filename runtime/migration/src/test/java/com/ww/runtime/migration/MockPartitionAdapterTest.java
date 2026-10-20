@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -60,7 +61,7 @@ class MockPartitionAdapterTest {
         int partition = partitionOfSeed("export-seed");
         List<Map.Entry<String, String>> entries = fill(partition, 25);
 
-        List<byte[]> chunks = adapter.exportChunks("mock", partition, 0L);
+        List<byte[]> chunks = drain(adapter.exportChunks("mock", partition, 0L));
         assertThat(chunks).hasSize(25);
 
         List<String> keys = new ArrayList<>();
@@ -81,20 +82,20 @@ class MockPartitionAdapterTest {
         int partition = partitionOfSeed("skip-seed");
         fill(partition, 40);
 
-        List<byte[]> full = adapter.exportChunks("mock", partition, 0L);
-        List<byte[]> tail = adapter.exportChunks("mock", partition, 17L);
+        List<byte[]> full = drain(adapter.exportChunks("mock", partition, 0L));
+        List<byte[]> tail = drain(adapter.exportChunks("mock", partition, 17L));
         assertThat(tail).hasSize(40 - 17);
         assertThat(tail).containsExactlyElementsOf(full.subList(17, full.size()));
 
-        assertThat(adapter.exportChunks("mock", partition, 40L)).isEmpty();
-        assertThat(adapter.exportChunks("mock", partition, 100L)).isEmpty(); // 越界钳制
+        assertThat(drain(adapter.exportChunks("mock", partition, 40L))).isEmpty();
+        assertThat(drain(adapter.exportChunks("mock", partition, 100L))).isEmpty(); // 越界钳制
     }
 
     @Test
     void importChunksRoundTripsAfterClear() {
         int partition = partitionOfSeed("roundtrip");
         List<Map.Entry<String, String>> entries = fill(partition, 20);
-        List<byte[]> chunks = adapter.exportChunks("mock", partition, 0L);
+        List<byte[]> chunks = drain(adapter.exportChunks("mock", partition, 0L));
 
         capability.clearPartition(partition); // 清空后仅靠分片数据恢复
         assertThat(capability.partitionCount(partition)).isZero();
@@ -109,7 +110,7 @@ class MockPartitionAdapterTest {
     void importChunksIsIdempotentUpsert() {
         int partition = partitionOfSeed("idempotent-seed");
         List<Map.Entry<String, String>> entries = fill(partition, 15);
-        List<byte[]> pieces = adapter.exportChunks("mock", partition, 0L);
+        List<byte[]> pieces = drain(adapter.exportChunks("mock", partition, 0L));
 
         // 同一批分片重复导入三次：条数不变、无重复键（Map upsert 语义）
         for (int i = 0; i < 3; i++) {
@@ -139,5 +140,12 @@ class MockPartitionAdapterTest {
         // 目标分区未被污染
         assertThat(capability.partitionCount(target)).isZero();
         assertThat(capability.partitionCount(partition)).isZero();
+    }
+
+    /** 物化惰性导出流（测试断言用）。 */
+    private static List<byte[]> drain(Iterator<byte[]> chunks) {
+        List<byte[]> all = new ArrayList<>();
+        chunks.forEachRemaining(all::add);
+        return all;
     }
 }

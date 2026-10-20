@@ -19,6 +19,7 @@ public final class InMemoryLeaseStore implements LeaseStore {
     private final Object lock = new Object();
     private String owner;
     private long expiresAtMillis;
+    private long leaderEpoch;
 
     public InMemoryLeaseStore() {
         this(SystemClock.instance());
@@ -30,6 +31,11 @@ public final class InMemoryLeaseStore implements LeaseStore {
 
     @Override
     public boolean acquireOrRenew(String owner, long ttlMillis) {
+        return acquireOrRenewWithEpoch(owner, ttlMillis) >= 0;
+    }
+
+    @Override
+    public long acquireOrRenewWithEpoch(String owner, long ttlMillis) {
         if (owner == null || owner.isBlank()) {
             throw new IllegalArgumentException("owner must not be null or blank");
         }
@@ -40,14 +46,22 @@ public final class InMemoryLeaseStore implements LeaseStore {
         synchronized (lock) {
             if (this.owner != null && this.owner.equals(owner)) {
                 expiresAtMillis = now + ttlMillis;
-                return true;
+                return leaderEpoch;
             }
             if (this.owner == null || expiresAtMillis < now) {
                 this.owner = owner;
                 expiresAtMillis = now + ttlMillis;
-                return true;
+                return ++leaderEpoch; // 每次换主单调递增（fencing token）
             }
-            return false;
+            return -1L;
+        }
+    }
+
+    @Override
+    public boolean isCurrent(String owner, long epoch) {
+        synchronized (lock) {
+            return this.owner != null && this.owner.equals(owner)
+                    && leaderEpoch == epoch && expiresAtMillis >= clock.nowMillis();
         }
     }
 

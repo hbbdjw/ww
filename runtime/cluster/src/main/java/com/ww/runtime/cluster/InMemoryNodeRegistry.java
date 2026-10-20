@@ -24,8 +24,8 @@ public final class InMemoryNodeRegistry implements NodeRegistry {
     @Override
     public void register(NodeInfo info) {
         Objects.requireNonNull(info, "info");
-        NodeInfo joining = NodeInfo.of(info.id(), info.host(), info.grpcPort(),
-                NodeState.JOINING, 0L, info.weight(), info.resources());
+        NodeInfo joining = NodeInfo.of(info.id(), info.host(), info.grpcPort(), info.httpPort(),
+                NodeState.JOINING, 0L, info.weight(), info.resources(), info.zone());
         nodes.put(info.id(), joining);
     }
 
@@ -33,8 +33,7 @@ public final class InMemoryNodeRegistry implements NodeRegistry {
     public void heartbeat(NodeId id, ResourceSnapshot snapshot) {
         Objects.requireNonNull(id, "id");
         Objects.requireNonNull(snapshot, "snapshot");
-        compute(id, current -> NodeInfo.of(current.id(), current.host(), current.grpcPort(),
-                current.state(), current.stateEpoch(), current.weight(), snapshot));
+        compute(id, current -> current.withState(current.state(), current.stateEpoch(), snapshot));
     }
 
     @Override
@@ -43,8 +42,7 @@ public final class InMemoryNodeRegistry implements NodeRegistry {
         Objects.requireNonNull(newState, "newState");
         compute(id, current -> {
             NodeStateMachine.check(current.state(), newState);
-            return NodeInfo.of(current.id(), current.host(), current.grpcPort(),
-                    newState, current.stateEpoch() + 1, current.weight(), current.resources());
+            return current.withState(newState, current.stateEpoch() + 1, current.resources());
         });
     }
 
@@ -73,8 +71,8 @@ public final class InMemoryNodeRegistry implements NodeRegistry {
             if (current == null || current.state() == NodeState.DEAD) {
                 return current;
             }
-            return NodeInfo.of(current.id(), current.host(), current.grpcPort(),
-                    NodeState.DEAD, current.stateEpoch() + 1, current.weight(), current.resources());
+            return current.withState(NodeState.DEAD, current.stateEpoch() + 1,
+                    current.resources());
         });
     }
 

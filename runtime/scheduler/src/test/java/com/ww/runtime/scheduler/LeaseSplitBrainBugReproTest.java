@@ -19,15 +19,15 @@ import java.util.List;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * 缺陷 4 回归测试（原脑裂复现已反转）：租约只在调谐周期<b>开始</b>时获取/续约，
+ * 验证长迁移的租约复核语义：租约只在调谐周期<b>开始</b>时获取/续约，
  * 而 {@code migrateAndWait} 在周期内同步阻塞——迁移耗时超过租约 TTL 时，
  * 租约在周期中途过期，另一节点接管 leadership。
  *
- * <p>修复后：旧 leader 迁移返回后先经 {@code stillLeader()} 复核租约，失租即
- * 自降 leader 身份并<b>中止</b>后续 freeze/stop 与写 actual 等副作用，不再产生
+ * <p>验证行为：旧 leader 迁移返回后先经 {@code stillLeader()} 复核租约，失租即
+ * 自降 leader 身份并<b>中止</b>后续 freeze/stop 与写 actual 等副作用，不产生
  * 「双 leader」重叠窗口（其迁移前的 freeze 属失租前合法动作，不受影响）。
  * 残余风险：复核与副作用下发间仍有微小竞态窗口、迁移期间 cutover 无法撤回；
- * fencing token 与后台续约线程（与 TestClock 确定性测试不兼容）留作后续演进。</p>
+ * 框架当前无 fencing token，亦无后台续约线程（与 TestClock 确定性测试不兼容）。</p>
  */
 class LeaseSplitBrainBugReproTest {
 
@@ -88,11 +88,10 @@ class LeaseSplitBrainBugReproTest {
 
         // 排空 A → 触发 (e) 下线迁移路径（慢迁移）
         writer.setDesired(A, MOCK, CapabilityState.DISABLED);
-        // 迁移期间租约被 loop2 抢占，runOnce() 应正确返回 false（租约丢失），
-        // 而非旧 bug 行为中始终返回初始 acquired=true
+        // 迁移期间租约被 loop2 抢占，runOnce() 应正确返回 false（租约丢失）
         assertThat(loop1.runOnce()).isFalse();
 
-        // 修复后的断言：迁移返回后 loop1 复核租约失租、自降身份并中止 stop 等副作用
+        // 迁移返回后 loop1 复核租约失租、自降身份并中止 stop 等副作用
         assertThat(loop2.isLeader()).as("租约中途过期后 sched-2 接管 leadership").isTrue();
         assertThat(loop1.isLeader())
                 .as("sched-1 迁移返回后复核租约失租，自降 leader 身份").isFalse();

@@ -1,0 +1,6 @@
+packages:
+  - '.'
+allowBuilds:
+  esbuild: false
+minimumReleaseAgeExclude:
+  - '@iconify-json/vscode-icons@1.2.74'

@@ -18,7 +18,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 /**
  * JdbcCapabilityStateStore 无真实数据库环境下的基础行为：
  * SQLException 一律包装为 RuntimeFrameworkException（真实建表/读写路径依赖
- * PostgreSQL，按任务要求以编译通过为准，不做集成测试）。
+ * PostgreSQL，由集成测试覆盖）。
  */
 class JdbcCapabilityStateStoreTest {
 

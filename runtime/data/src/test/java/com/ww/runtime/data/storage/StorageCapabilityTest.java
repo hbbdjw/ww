@@ -1,19 +1,7 @@
 package com.ww.runtime.data.storage;
 
-import com.ww.runtime.capability.PlacementView;
-import com.ww.runtime.common.CapabilityType;
-import com.ww.runtime.common.NodeId;
-import com.ww.runtime.common.PartitionId;
-import com.ww.runtime.common.RuntimeFrameworkException;
-import com.ww.runtime.common.StaleEpochException;
-import com.ww.runtime.data.storage.engine.ObjectMetadata;
-import com.ww.runtime.data.storage.engine.ObjectStore;
-import com.ww.runtime.data.storage.engine.StorageProperties;
-import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.io.TempDir;
-
 import java.io.ByteArrayInputStream;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
@@ -25,6 +13,20 @@ import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import com.ww.runtime.capability.PlacementView;
+import com.ww.runtime.common.CapabilityType;
+import com.ww.runtime.common.NodeId;
+import com.ww.runtime.common.PartitionId;
+import com.ww.runtime.common.RuntimeFrameworkException;
+import com.ww.runtime.common.StaleEpochException;
+import com.ww.runtime.data.storage.engine.ObjectMetadata;
+import com.ww.runtime.data.storage.engine.ObjectStore;
+import com.ww.runtime.data.storage.engine.StorageProperties;
 
 /**
  * StorageCapability：fencing 写入、读写删列举与对象级迁移（分片/聚合/幂等/断点）。
@@ -158,6 +160,11 @@ class StorageCapabilityTest {
         // 重复导入幂等（putReplica 同 version 跳过）
         assertThat(target.importChunks(chunks)).isTrue();
         assertThat(target.head("b1", "k1").getVersion()).isEqualTo(1L);
+
+        // T1：导入完成后暂存目录无残留（流式落盘不得泄漏暂存文件）
+        File staging = tempDir.resolve("dst").resolve(".import-tmp").toFile();
+        File[] leftovers = staging.listFiles((d, n) -> n.endsWith(".mig"));
+        assertThat(leftovers == null ? new File[0] : leftovers).isEmpty();
     }
 
     @Test
@@ -185,13 +192,17 @@ class StorageCapabilityTest {
                 StorageCapabilityTest::partitioner, props(tempDir.resolve("dst2")), 8);
         target.start();
 
-        // 跳过首片直接喂末片 → 偏移不连续 → false
+        // 跳过首片直接喂末片 → 偏移不连续 → false（聚合已中止，无残留）
         assertThat(target.importChunks(List.of(chunks.get(1)))).isFalse();
         // 非法分片 → false
         assertThat(target.importChunks(List.of("garbage".getBytes()))).isFalse();
         // 完整重喂恢复
         assertThat(target.importChunks(chunks)).isTrue();
         assertThat(target.head("b1", "k1")).isNotNull();
+        // T1：失败与成功路径均不得残留暂存文件
+        File staging = tempDir.resolve("dst2").resolve(".import-tmp").toFile();
+        File[] leftovers = staging.listFiles((d, n) -> n.endsWith(".mig"));
+        assertThat(leftovers == null ? new File[0] : leftovers).isEmpty();
     }
 
     @Test
@@ -396,6 +407,36 @@ class StorageCapabilityTest {
         assertThat(all).extracting(ObjectMetadata::getKey).containsExactly("a", "b", "c");
     }
 
+    @Test
+    @DisplayName("T3：索引容量满后列举降级目录扫描，对象仍完整可见（正确性优先）")
+    void indexCapacityOverflowDegradesListingWithoutDataLoss() throws IOException {
+        StorageProperties capped = props(tempDir.resolve("capped"));
+        capped.setMetadataIndexMaxEntries(2); // 极小上限：第 3 个对象即触发降级
+        StorageCapability cappedCap = new StorageCapability(SELF, view,
+                StorageCapabilityTest::partitioner, capped, 8);
+        cappedCap.start();
+        view.owner = Optional.of(new PlacementView.Owner(SELF, 3L));
+        try {
+            for (String key : new String[]{"a", "b", "c", "d"}) {
+                byte[] bytes = ("v-" + key).getBytes(StandardCharsets.UTF_8);
+                cappedCap.putObject("b1", key, new ByteArrayInputStream(bytes),
+                        bytes.length, "text/plain", null);
+            }
+            // 降级桶：列举经目录扫描仍全量可见且按 key 排序（语义不变）
+            assertThat(cappedCap.listAllObjects("b1"))
+                    .extracting(ObjectMetadata::getKey).containsExactly("a", "b", "c", "d");
+            assertThat(cappedCap.countObjects("b1")).isEqualTo(4L);
+            assertThat(cappedCap.totalObjectCount()).isEqualTo(4L);
+            // 读路径不受索引降级影响；删除后经扫描同样不再可见
+            assertThat(cappedCap.head("b1", "d")).isNotNull();
+            assertThat(cappedCap.deleteObject("b1", "d")).isTrue();
+            assertThat(cappedCap.listAllObjects("b1"))
+                    .extracting(ObjectMetadata::getKey).containsExactly("a", "b", "c");
+        } finally {
+            cappedCap.stop();
+        }
+    }
+
     // ---- 动态调度：清扫 / 属主探测 / 计数 ----
 
     @Test
@@ -443,6 +484,139 @@ class StorageCapabilityTest {
         byte[] bytes = data.getBytes(StandardCharsets.UTF_8);
         return capability.putObject(bucket, key, new ByteArrayInputStream(bytes),
                 bytes.length, "text/plain", null);
+    }
+
+    // ---- P0-1 半同步复制（写路径等副本确认） ----
+
+    /** 记录型写钩子：afterPut/afterDelete 异步路径记账；replicateSync 返回可注入的确认结果。 */
+    private static final class RecordingHook implements StorageCapability.WriteHook {
+        final List<String> asyncPuts = new ArrayList<>();
+        final List<String> asyncDeletes = new ArrayList<>();
+        volatile boolean syncAck = true;
+        int syncCalls;
+
+        @Override
+        public void afterPut(String bucket, ObjectMetadata meta) {
+            asyncPuts.add(bucket + "/" + meta.getKey());
+        }
+
+        @Override
+        public void afterDelete(String bucket, String key) {
+            asyncDeletes.add(bucket + "/" + key);
+        }
+
+        @Override
+        public boolean replicateSync(String bucket, ObjectMetadata meta, java.time.Duration timeout) {
+            syncCalls++;
+            return syncAck;
+        }
+
+        @Override
+        public boolean replicateDeleteSync(String bucket, String key, java.time.Duration timeout) {
+            syncCalls++;
+            return syncAck;
+        }
+    }
+
+    @Test
+    void semiSyncDisabledKeepsAsyncHookSemantics() throws IOException {
+        RecordingHook hook = new RecordingHook();
+        capability.setWriteHook(hook);
+
+        putObj("b1", "k1", "async-mode");
+
+        assertThat(hook.asyncPuts).containsExactly("b1/k1");
+        assertThat(hook.syncCalls).isZero(); // 半同步关：不走同步钩子
+    }
+
+    @Test
+    void semiSyncEnabledWaitsForReplicaAckBeforeReturning() throws IOException {
+        StorageProperties semi = props(tempDir.resolve("semi"));
+        semi.setSemiSyncEnabled(true);
+        StorageCapability semiCapability = new StorageCapability(SELF, view,
+                StorageCapabilityTest::partitioner, semi, 8);
+        semiCapability.start();
+        RecordingHook hook = new RecordingHook();
+        semiCapability.setWriteHook(hook);
+
+        ObjectMetadata meta = semiCapability.putObject("b1", "k1",
+                new ByteArrayInputStream("semi".getBytes(StandardCharsets.UTF_8)),
+                4L, "text/plain", null);
+
+        assertThat(meta.getVersion()).isEqualTo(1L);
+        assertThat(hook.syncCalls).isEqualTo(1); // 写路径确实走了半同步
+        assertThat(hook.asyncPuts).isEmpty(); // 半同步开：不再 fire-and-forget
+        assertThat(semiCapability.atRiskTotal()).isZero();
+    }
+
+    @Test
+    void semiSyncTimeoutFailClosedRejectsWrite() throws IOException {
+        StorageProperties semi = props(tempDir.resolve("fail-closed"));
+        semi.setSemiSyncEnabled(true);
+        semi.setSemiSyncFailClosed(true);
+        StorageCapability semiCapability = new StorageCapability(SELF, view,
+                StorageCapabilityTest::partitioner, semi, 8);
+        semiCapability.start();
+        RecordingHook hook = new RecordingHook();
+        hook.syncAck = false; // 副本未确认
+        semiCapability.setWriteHook(hook);
+
+        assertThatThrownBy(() -> semiCapability.putObject("b1", "k1",
+                new ByteArrayInputStream("lost?".getBytes(StandardCharsets.UTF_8)),
+                6L, "text/plain", null))
+                .isInstanceOf(com.ww.runtime.common.ReplicationTimeoutException.class)
+                .hasMessageContaining("semi-sync");
+        // fail-closed：本地已落盘但拒绝应答——数据留待对账/人工，客户端明确知道失败
+        assertThat(semiCapability.atRiskTotal()).isZero();
+    }
+
+    @Test
+    void semiSyncTimeoutDegradeRecordsAtRiskAndAcknowledges() throws IOException {
+        StorageProperties semi = props(tempDir.resolve("degrade"));
+        semi.setSemiSyncEnabled(true); // failClosed 默认 false = 降级应答
+        StorageCapability semiCapability = new StorageCapability(SELF, view,
+                StorageCapabilityTest::partitioner, semi, 8);
+        semiCapability.start();
+        RecordingHook hook = new RecordingHook();
+        hook.syncAck = false;
+        semiCapability.setWriteHook(hook);
+
+        ObjectMetadata meta = semiCapability.putObject("b1", "k1",
+                new ByteArrayInputStream("at-risk".getBytes(StandardCharsets.UTF_8)),
+                7L, "text/plain", null);
+
+        // 降级：照常应答，但 at-risk 观测记录（总数 + 快照）
+        assertThat(meta.getVersion()).isEqualTo(1L);
+        assertThat(semiCapability.atRiskTotal()).isEqualTo(1L);
+        assertThat(semiCapability.atRiskSnapshot()).hasSize(1);
+        assertThat(semiCapability.atRiskSnapshot().getFirst().bucket()).isEqualTo("b1");
+        assertThat(semiCapability.atRiskSnapshot().getFirst().key()).isEqualTo("k1");
+        assertThat(semiCapability.atRiskSnapshot().getFirst().version()).isEqualTo(1L);
+        assertThat(semiCapability.atRiskSnapshot().getFirst().delete()).isFalse();
+    }
+
+    @Test
+    void semiSyncDeleteTimeoutDegradeRecordsAtRisk() {
+        StorageProperties semi = props(tempDir.resolve("degrade-del"));
+        semi.setSemiSyncEnabled(true);
+        StorageCapability semiCapability = new StorageCapability(SELF, view,
+                StorageCapabilityTest::partitioner, semi, 8);
+        semiCapability.start();
+        RecordingHook hook = new RecordingHook();
+        semiCapability.setWriteHook(hook);
+        try {
+            semiCapability.putObject("b1", "k1",
+                    new ByteArrayInputStream("bye".getBytes(StandardCharsets.UTF_8)),
+                    3L, "text/plain", null);
+        } catch (IOException e) {
+            throw new IllegalStateException(e);
+        }
+        assertThat(semiCapability.atRiskTotal()).isZero(); // put 阶段副本已确认
+
+        hook.syncAck = false; // 删除时副本失联
+        assertThat(semiCapability.deleteObject("b1", "k1")).isTrue();
+        assertThat(semiCapability.atRiskTotal()).isEqualTo(1L);
+        assertThat(semiCapability.atRiskSnapshot().getFirst().delete()).isTrue();
     }
 
     /** 可变桩视图。 */

@@ -19,17 +19,16 @@ import java.util.Deque;
 import java.util.List;
 import java.util.Map;
 import java.util.NavigableMap;
+import java.util.Objects;
 import java.util.TreeMap;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
-import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
-import tools.jackson.databind.ObjectMapper;
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import tools.jackson.databind.ObjectMapper;
 
 /**
  * 对象本地存储：将数据与元数据作为对象一起写入 Drive（.data + .meta 同目录），无需元数据库。
@@ -45,7 +44,8 @@ import org.slf4j.LoggerFactory;
  * 读取：读 .meta 后读 .data，主节点本地读保证 read-after-write。
  *
  * <p>列举/计数不经磁盘：启动时 {@link #rebuildIndex()} 从全部 {@code object.meta}
- * 一次性重建内存有序索引，此后写/删增量维护（见 {@link #index} 字段说明）。
+ * 一次性重建内存有序索引（{@link MetadataIndex}），此后写/删增量维护；
+ * 索引容量满后新增被拒，受影响桶列举降级目录扫描（T3 止血：正确性优先）。
  *
  * <p>复制路径 {@link #putReplica} 使用主节点计算的 ETag/version，保证主备一致。
  *
@@ -118,40 +118,44 @@ public class ObjectStore {
     }
 
     /**
-     * 对象元数据索引：Drive → bucket → key 有序（{@link ConcurrentSkipListMap}）。
+     * 对象元数据索引（T3：抽出 {@link MetadataIndex} 承载容量上限与降级语义）。
      *
      * <p>元数据落盘为散列目录下的 {@code object.meta} 文件（目录名 = SHA-1(key)，与 key
      * 顺序无关），无法按 prefix/marker 剪枝——列举若走全盘扫描则成本 O(全部对象数)，
-     * 分页形同虚设。本索引在 {@link #rebuildIndex()}（能力启动时）从磁盘一次性重建，
+     * 分页形同虚设。索引在 {@link #rebuildIndex()}（能力启动时）从磁盘一次性重建，
      * 此后写/删在条带锁内、文件 rename 成功后增量维护，与磁盘严格一致；
      * 列举/计数经索引定位降为 O(log N + pageSize)。
      *
      * <p>按 Drive 隔离是为了保持列举的既有语义：离线 Drive 上的对象不参与列举/计数。
      * 重建对所有 Drive 执行（含离线的），Drive 恢复在线后无需再建。
      */
-    private final Map<Drive, ConcurrentHashMap<String, ConcurrentSkipListMap<String, ObjectMetadata>>> index
-            = new ConcurrentHashMap<>();
+    private final MetadataIndex metadataIndex;
 
-    /** 取（不存在则建）指定 Drive 上桶的有序索引。仅写路径使用——允许创建空映射。 */
-    private ConcurrentSkipListMap<String, ObjectMetadata> indexOf(Drive drive, String bucket) {
-        return index.computeIfAbsent(drive, d -> new ConcurrentHashMap<>())
-                .computeIfAbsent(bucket, b -> new ConcurrentSkipListMap<>());
-    }
-
-    /** 只读取指定 Drive 上桶的有序索引（不存在返回 null，不创建空映射）。 */
-    private ConcurrentSkipListMap<String, ObjectMetadata> peekIndex(Drive drive, String bucket) {
-        Map<String, ConcurrentSkipListMap<String, ObjectMetadata>> byBucket = index.get(drive);
-        return byBucket == null ? null : byBucket.get(bucket);
-    }
+    /** T13：副本路径 fsync 开关（默认 false = 与主路径一致做 fsync；磁盘密集场景可配置跳过） */
+    private volatile boolean replicaSkipFsync = false;
+    /** T26：同 version 异 etag 冲突计数（默认策略：保留先到 + 告警留痕） */
+    private final java.util.concurrent.atomic.AtomicLong sameVersionConflicts =
+            new java.util.concurrent.atomic.AtomicLong();
+    /** T15：损坏元数据隔离计数 */
+    private final java.util.concurrent.atomic.AtomicLong corruptedMetaQuarantined =
+            new java.util.concurrent.atomic.AtomicLong();
 
     public ObjectStore(DriveManager driveManager, SetLocator setLocator,
                        CryptoCodec cryptoCodec, ObjectMapper objectMapper,
                        ByteBufferPool bufferPool) {
+        this(driveManager, setLocator, cryptoCodec, objectMapper, bufferPool,
+                new MetadataIndex(0)); // 兼容构造：不限容量（测试/单机小场景）
+    }
+
+    public ObjectStore(DriveManager driveManager, SetLocator setLocator,
+                       CryptoCodec cryptoCodec, ObjectMapper objectMapper,
+                       ByteBufferPool bufferPool, MetadataIndex metadataIndex) {
         this.driveManager = driveManager;
         this.setLocator = setLocator;
         this.cryptoCodec = cryptoCodec;
         this.objectMapper = objectMapper;
         this.bufferPool = bufferPool;
+        this.metadataIndex = metadataIndex;
     }
 
     private MessageDigest borrowMd5() {
@@ -165,6 +169,21 @@ public class ObjectStore {
         } catch (NoSuchAlgorithmException e) {
             throw new StorageException("MD5 不可用", e);
         }
+    }
+
+    /** T13：副本写路径 fsync 配置（true=跳过 fsync，默认 false 与主路径一致）。 */
+    public void setReplicaSkipFsync(boolean replicaSkipFsync) {
+        this.replicaSkipFsync = replicaSkipFsync;
+    }
+
+    /** T26：同 version 异 etag 冲突计数（观测口）。 */
+    public long getSameVersionConflicts() {
+        return sameVersionConflicts.get();
+    }
+
+    /** T15：损坏元数据隔离计数（观测口）。 */
+    public long getCorruptedMetaQuarantined() {
+        return corruptedMetaQuarantined.get();
     }
 
     private void returnMd5(MessageDigest d) {
@@ -201,13 +220,21 @@ public class ObjectStore {
             ObjectMetadata existing = readMeta(drive, bucket, loc.getKeySha1());
             if (existing != null) {
                 newVersion = existing.getVersion() + 1;
+            } else if (drive.objectDataFile(bucket, loc.getKeySha1()).exists()) {
+                // T15：有 data 无合法 meta（元数据损坏被隔离）——拒绝覆盖写，
+                // 防止 version 静默重置为 1 造成主备分叉；需人工恢复后才能重建
+                throw new StorageException("对象数据存在但元数据缺失/损坏，拒绝覆盖写（防版本重置）: "
+                        + bucket + "/" + key);
             }
             ObjectMetadata meta = new ObjectMetadata(key, -1L, contentType, null,
                     System.currentTimeMillis(), newVersion);
             if (userMeta != null) meta.setUserMetadata(userMeta);
             StoredObject stored = writeObject(drive, bucket, loc.getKeySha1(), data, meta, false);
-            // rename 成功后登记索引（锁内）：列举即时可见，与磁盘严格一致
-            indexOf(drive, bucket).put(key, stored.meta);
+            // rename 成功后登记索引（锁内）：列举即时可见，与磁盘严格一致；
+            // T3：容量满被拒 → 该桶列举降级目录扫描（读路径不受影响）
+            if (!metadataIndex.putGuarded(drive, bucket, key, stored.meta)) {
+                metadataIndex.degradeBucket(bucket);
+            }
             return stored;
         } finally {
             lock.unlock();
@@ -238,8 +265,21 @@ public class ObjectStore {
         lock.lock();
         try {
             ObjectMetadata existing = readMeta(drive, bucket, loc.getKeySha1());
-            if (existing != null && existing.getVersion() >= meta.getVersion()) {
+            if (existing != null && existing.getVersion() > meta.getVersion()) {
                 return new StoredObject(existing, drive.objectDataFile(bucket, loc.getKeySha1()), bucket);
+            }
+            if (existing != null && existing.getVersion() == meta.getVersion()) {
+                boolean sameContent = meta.getEtag() == null || existing.getEtag() == null
+                        || Objects.equals(existing.getEtag(), meta.getEtag());
+                if (sameContent) {
+                    return new StoredObject(existing, drive.objectDataFile(bucket, loc.getKeySha1()), bucket);
+                }
+                // T26/P1-6：同 version 异 etag = 双主/脑裂遗留冲突。主节点是权威方，
+                // 以本次推送内容覆盖（否则先到者永久占据副本，对账只比 version 永远修不好）。
+                sameVersionConflicts.incrementAndGet();
+                log.warn("T26 同版本 ETag 冲突（主端权威覆盖）: bucket={} key={} version={} "
+                                + "existingEtag={} incomingEtag={}",
+                        bucket, key, meta.getVersion(), existing.getEtag(), meta.getEtag());
             }
             // T12：大小上限校验置于版本跳过之后，避免误伤合法存量对象的冗余重放
             if (length > maxObjectSize) {
@@ -248,10 +288,12 @@ public class ObjectStore {
             ObjectMetadata copy = new ObjectMetadata(key, meta.getSize(), meta.getContentType(),
                     meta.getEtag(), meta.getCreatedAt(), meta.getVersion());
             copy.setUserMetadata(meta.getUserMetadata());
-            StoredObject stored = writeObject(drive, bucket, loc.getKeySha1(), data, copy, true);
-            // rename 成功后登记索引（锁内）：与防回退语义一致，仅保留不低于既有的版本
-            indexOf(drive, bucket).merge(key, stored.meta,
-                    (a, b) -> a.getVersion() >= b.getVersion() ? a : b);
+            StoredObject stored = writeObject(drive, bucket, loc.getKeySha1(), data, copy, replicaSkipFsync);
+            // rename 成功后登记索引（锁内）：与防回退语义一致，仅保留不低于既有的版本；
+            // T3：容量满被拒 → 该桶列举降级目录扫描（读路径不受影响）
+            if (!metadataIndex.mergeGuarded(drive, bucket, key, stored.meta)) {
+                metadataIndex.degradeBucket(bucket);
+            }
             return stored;
         } finally {
             lock.unlock();
@@ -303,6 +345,11 @@ public class ObjectStore {
             if (needCount) meta.setSize(size);
             if (computeMd5) meta.setEtag(toHex(digest.digest()));
 
+            // T13：数据文件 fsync 统一收口（快路径内部已 force；流路径在此补齐）
+            if (!skipFsync) {
+                fsyncFileQuietly(dataTmp);
+            }
+
             // 写元信息 tmp
             File metaFile = drive.objectMetaFile(bucket, keySha1);
             File metaTmp;
@@ -313,13 +360,50 @@ public class ObjectStore {
                 safeDelete(dataTmp);
                 throw new StorageException("写入对象元信息失败: " + meta.getKey(), e);
             }
+            // T13：元数据 fsync——meta 可见即代表数据+元数据均已持久化
+            if (!skipFsync) {
+                fsyncFileQuietly(metaTmp);
+            }
 
-            // 先暴露数据再暴露元信息：元信息可见即代表数据已完整落盘
+            // T5 覆盖写两段提交：先备份旧 data，再依次暴露新 data/meta；
+            // meta 改名失败可完整回滚（消除"新数据 + 旧 meta"错配对窗口）
             File dataFile = drive.objectDataFile(bucket, keySha1);
-            if (!atomicRename(dataTmp, dataFile) || !atomicRename(metaTmp, metaFile)) {
-                safeDelete(dataTmp);
+            File dataOld = null;
+            if (dataFile.exists()) {
+                try {
+                    dataOld = Drive.tempFile(objDir, "object.data.old");
+                } catch (IOException e) {
+                    safeDelete(dataTmp);
+                    safeDelete(metaTmp);
+                    throw new StorageException("旧数据备份文件创建失败: " + meta.getKey(), e);
+                }
+                if (!atomicRename(dataFile, dataOld)) {
+                    safeDelete(dataTmp);
+                    safeDelete(metaTmp);
+                    safeDelete(dataOld);
+                    throw new StorageException("旧数据备份改名失败: " + meta.getKey());
+                }
+            }
+            if (!atomicRename(dataTmp, dataFile)) {
+                if (dataOld != null) {
+                    atomicRename(dataOld, dataFile); // 回滚旧数据
+                }
                 safeDelete(metaTmp);
-                throw new StorageException("对象改名失败: " + meta.getKey());
+                throw new StorageException("对象数据改名失败: " + meta.getKey());
+            }
+            if (!atomicRename(metaTmp, metaFile)) {
+                // meta 改名失败：删新数据 + 恢复旧数据 + 保留旧 meta（旧读写对完好）
+                safeDelete(dataFile);
+                if (dataOld != null) {
+                    atomicRename(dataOld, dataFile);
+                }
+                safeDelete(metaTmp);
+                throw new StorageException("对象元信息改名失败: " + meta.getKey());
+            }
+            safeDelete(dataOld);
+            // T13：rename 后目录 fsync，保证掉电后目录项可见（Windows 目录 fsync 不支持，静默跳过）
+            if (!skipFsync) {
+                fsyncDirQuietly(objDir);
             }
             return new StoredObject(meta, dataFile, bucket);
         } finally {
@@ -361,7 +445,6 @@ public class ObjectStore {
                     remaining -= t;
                 }
                 if (needCount) size = position;
-                if (!skipFsync) fc.force(false);
                 return size;
             }
 
@@ -385,7 +468,6 @@ public class ObjectStore {
                     if (needCount) size += n;
                 }
             }
-            if (!skipFsync) fc.force(false);
             return size;
         }
     }
@@ -421,7 +503,15 @@ public class ObjectStore {
         SetLocator.LocatedDrive loc = setLocator.locate(bucket, key);
         Drive drive = loc.getDrive();
         ObjectMetadata meta = readMeta(drive, bucket, loc.getKeySha1());
-        if (meta == null) return null;
+        if (meta == null) {
+            File dataFile = drive.objectDataFile(bucket, loc.getKeySha1());
+            if (dataFile.exists()) {
+                // T15：有 data 无合法 meta → 显式失败（映射 500）而非 404，
+                // 防止对象被"不存在"误判后静默重建
+                throw new StorageException("对象数据存在但元数据缺失/损坏: bucket=" + bucket + " key=" + key);
+            }
+            return null;
+        }
         File dataFile = drive.objectDataFile(bucket, loc.getKeySha1());
         if (!dataFile.exists()) {
             log.warn("对象元信息存在但数据缺失: bucket={} key={}", bucket, key);
@@ -433,7 +523,30 @@ public class ObjectStore {
     /** 仅读元数据（HEAD） */
     public ObjectMetadata head(String bucket, String key) {
         SetLocator.LocatedDrive loc = setLocator.locate(bucket, key);
-        return readMeta(loc.getDrive(), bucket, loc.getKeySha1());
+        Drive drive = loc.getDrive();
+        ObjectMetadata meta = readMeta(drive, bucket, loc.getKeySha1());
+        if (meta == null && drive.objectDataFile(bucket, loc.getKeySha1()).exists()) {
+            // T15：与 get 同口径——孤儿数据 HEAD 也显式失败（映射 500）
+            throw new StorageException("对象数据存在但元数据缺失/损坏: bucket=" + bucket + " key=" + key);
+        }
+        return meta;
+    }
+
+    /**
+     * T18：带缓存元数据的读取——命中调用方缓存时跳过盘上 readMeta（GET 写穿缓存路径）。
+     * 数据文件不存在返回 null（缓存条目将随下次删除写穿/失效收敛）。
+     */
+    public StoredObject get(String bucket, String key, ObjectMetadata cachedMeta) {
+        if (cachedMeta == null) {
+            return get(bucket, key);
+        }
+        SetLocator.LocatedDrive loc = setLocator.locate(bucket, key);
+        Drive drive = loc.getDrive();
+        File dataFile = drive.objectDataFile(bucket, loc.getKeySha1());
+        if (!dataFile.exists()) {
+            return null;
+        }
+        return new StoredObject(cachedMeta, dataFile, bucket);
     }
 
     /**
@@ -466,11 +579,8 @@ public class ObjectStore {
             boolean metaDeleted = metaFile.exists() && metaFile.delete();
             boolean dataDeleted = dataFile.exists() && dataFile.delete();
             cleanupEmptyDirs(drive.objectDir(bucket, loc.getKeySha1()), drive.objectsDir(bucket));
-            // 同步摘除索引（锁内）：已删对象不再出现在列举/计数中
-            ConcurrentSkipListMap<String, ObjectMetadata> idx = peekIndex(drive, bucket);
-            if (idx != null) {
-                idx.remove(key);
-            }
+            // 同步摘除索引（锁内）：已删对象不再出现在列举/计数中（降级桶无索引条目，no-op 无害）
+            metadataIndex.remove(drive, bucket, key);
             return metaDeleted || dataDeleted;
         } finally {
             lock.unlock();
@@ -484,6 +594,9 @@ public class ObjectStore {
      * maxKeys 条早停，跨 Drive 合并并按 key 排序，最后截断到 maxKeys 给出
      * nextMarker/truncated。复杂度 O(D×(log N + maxKeys))（D 为在线 Drive 数），
      * 与桶内对象总数无关。
+     *
+     * <p>T3：索引容量满后降级的桶改走目录扫描（语义不变：同口径过滤/排序/分页），
+     * 正确性优先于 O(logN)。
      */
     public ListResult list(String bucket, String prefix, String marker, int maxKeys) {
         if (maxKeys <= 0) maxKeys = 1000;
@@ -491,23 +604,27 @@ public class ObjectStore {
         String upper = hasPrefix ? prefixUpperBound(prefix) : null;
         boolean hasMarker = marker != null && !marker.isEmpty();
         TreeMap<String, ObjectMetadata> merged = new TreeMap<>();
-        for (Drive d : driveManager.getDrives()) {
-            if (!d.isOnline()) continue;
-            NavigableMap<String, ObjectMetadata> map = peekIndex(d, bucket);
-            if (map == null || map.isEmpty()) continue;
-            NavigableMap<String, ObjectMetadata> view = map;
-            if (hasPrefix) {
-                view = upper == null ? map.tailMap(prefix, true) : map.subMap(prefix, true, upper, false);
-            }
-            if (hasMarker) {
-                view = view.tailMap(marker, false);
-            }
-            int taken = 0;
-            for (Map.Entry<String, ObjectMetadata> e : view.entrySet()) {
-                if (taken >= maxKeys) break;
-                // SetLocator 稳定散列到单一 Drive，同 key 不跨 Drive；merge 仅作兜底
-                merged.merge(e.getKey(), e.getValue(), (a, b) -> a.getVersion() >= b.getVersion() ? a : b);
-                taken++;
+        if (metadataIndex.isDegraded(bucket)) {
+            collectScan(bucket, hasPrefix ? prefix : null, upper, hasMarker ? marker : null, merged);
+        } else {
+            for (Drive d : driveManager.getDrives()) {
+                if (!d.isOnline()) continue;
+                NavigableMap<String, ObjectMetadata> map = metadataIndex.peekIndex(d, bucket);
+                if (map == null || map.isEmpty()) continue;
+                NavigableMap<String, ObjectMetadata> view = map;
+                if (hasPrefix) {
+                    view = upper == null ? map.tailMap(prefix, true) : map.subMap(prefix, true, upper, false);
+                }
+                if (hasMarker) {
+                    view = view.tailMap(marker, false);
+                }
+                int taken = 0;
+                for (Map.Entry<String, ObjectMetadata> e : view.entrySet()) {
+                    if (taken >= maxKeys) break;
+                    // SetLocator 稳定散列到单一 Drive，同 key 不跨 Drive；merge 仅作兜底
+                    merged.merge(e.getKey(), e.getValue(), (a, b) -> a.getVersion() >= b.getVersion() ? a : b);
+                    taken++;
+                }
             }
         }
         List<ObjectMetadata> out = new ArrayList<>(merged.values());
@@ -521,12 +638,17 @@ public class ObjectStore {
         return new ListResult(out, nextMarker, truncated);
     }
 
-    /** 桶内对象全量快照（索引遍历，按 key 排序）：复制对账/迁移清扫等共用。 */
+    /** 桶内对象全量快照（索引遍历，按 key 排序）：复制对账/迁移清扫等共用；降级桶走目录扫描。 */
     public List<ObjectMetadata> snapshot(String bucket) {
+        if (metadataIndex.isDegraded(bucket)) {
+            TreeMap<String, ObjectMetadata> scanned = new TreeMap<>();
+            collectScan(bucket, null, null, null, scanned);
+            return new ArrayList<>(scanned.values());
+        }
         TreeMap<String, ObjectMetadata> merged = new TreeMap<>();
         for (Drive d : driveManager.getDrives()) {
             if (!d.isOnline()) continue;
-            NavigableMap<String, ObjectMetadata> map = peekIndex(d, bucket);
+            NavigableMap<String, ObjectMetadata> map = metadataIndex.peekIndex(d, bucket);
             if (map != null) {
                 merged.putAll(map);
             }
@@ -534,28 +656,33 @@ public class ObjectStore {
         return new ArrayList<>(merged.values());
     }
 
-    /** 指定桶对象数（索引计数；与 {@link #list} 同口径——不计离线 Drive）。 */
+    /** 指定桶对象数（索引计数；与 {@link #list} 同口径——不计离线 Drive）；降级桶走目录扫描。 */
     public long countObjects(String bucket) {
+        if (metadataIndex.isDegraded(bucket)) {
+            return snapshot(bucket).size();
+        }
         long count = 0L;
         for (Drive d : driveManager.getDrives()) {
             if (!d.isOnline()) continue;
-            NavigableMap<String, ObjectMetadata> map = peekIndex(d, bucket);
+            NavigableMap<String, ObjectMetadata> map = metadataIndex.peekIndex(d, bucket);
             if (map != null) count += map.size();
         }
         return count;
     }
 
-    /** 本节点全部桶的对象总数（索引计数）。 */
+    /** 本节点全部桶的对象总数（索引计数；降级桶经目录扫描补差，口径与列举一致）。 */
     public long countAll() {
         long count = 0L;
         for (Drive d : driveManager.getDrives()) {
             if (!d.isOnline()) continue;
-            Map<String, ConcurrentSkipListMap<String, ObjectMetadata>> byBucket = index.get(d);
-            if (byBucket != null) {
-                for (ConcurrentSkipListMap<String, ObjectMetadata> map : byBucket.values()) {
-                    count += map.size();
-                }
+            for (String bucket : metadataIndex.bucketsOn(d)) {
+                if (metadataIndex.isDegraded(bucket)) continue; // 降级桶统一在下方扫描计，避免重复/遗漏
+                NavigableMap<String, ObjectMetadata> map = metadataIndex.peekIndex(d, bucket);
+                if (map != null) count += map.size();
             }
+        }
+        for (String bucket : metadataIndex.degradedBucketsView()) {
+            count += snapshot(bucket).size();
         }
         return count;
     }
@@ -566,7 +693,7 @@ public class ObjectStore {
      */
     public void rebuildIndex() {
         long start = System.currentTimeMillis();
-        index.clear();
+        metadataIndex.clear();
         long total = 0L;
         for (Drive d : driveManager.getDrives()) {
             File[] bucketDirs = d.bucketsDir().listFiles();
@@ -575,34 +702,42 @@ public class ObjectStore {
                 if (!bdir.isDirectory()) continue;
                 File objectsDir = new File(bdir, "objects");
                 if (!objectsDir.isDirectory()) continue;
-                total += scanInto(objectsDir, indexOf(d, bdir.getName()));
+                total += scanInto(d, bdir.getName(), objectsDir);
             }
         }
         log.info("对象元数据索引重建完成: objects={} cost={}ms", total, System.currentTimeMillis() - start);
     }
 
-    /** 清除指定桶的索引（删桶成功后调用）。 */
+    /** 清除指定桶的索引（删桶成功后调用），同步回收容量计数与降级标记。 */
     public void dropBucketIndex(String bucket) {
-        for (Map<String, ConcurrentSkipListMap<String, ObjectMetadata>> byBucket : index.values()) {
-            byBucket.remove(bucket);
-        }
+        metadataIndex.dropBucket(bucket);
+    }
+
+    /** 索引观测口（容量/降级状态供管理与测试）。 */
+    public MetadataIndex metadataIndex() {
+        return metadataIndex;
+    }
+
+    /** T22：索引变更代数（分区计数快照复用依据）。 */
+    public long indexGeneration() {
+        return metadataIndex.generation();
     }
 
     // ==================== 内部工具 ====================
 
     /** 递归扫描对象目录，将解析成功的元数据装入索引；返回装入条数。 */
-    private int scanInto(File dir, ConcurrentSkipListMap<String, ObjectMetadata> sink) {
+    private int scanInto(Drive drive, String bucket, File dir) {
         File[] cs = dir.listFiles();
         if (cs == null) return 0;
         int count = 0;
         for (File c : cs) {
             if (c.isDirectory()) {
-                count += scanInto(c, sink);
+                count += scanInto(drive, bucket, c);
             } else if ("object.meta".equals(c.getName())) {
                 try {
                     ObjectMetadata m = objectMapper.readValue(c, ObjectMetadata.class);
                     if (m != null && m.getKey() != null) {
-                        sink.put(m.getKey(), m);
+                        metadataIndex.putDirect(drive, bucket, m.getKey(), m);
                         count++;
                     }
                 } catch (Exception e) {
@@ -611,6 +746,44 @@ public class ObjectStore {
             }
         }
         return count;
+    }
+
+    /**
+     * T3 降级目录扫描：扫描全部在线 Drive 上指定桶的对象目录，按与索引路径同口径的
+     * prefix 区间（含上界）与 marker（排他）过滤后装入 sink（有序去重）。
+     * 正确性优先：成本 O(桶内对象数)，仅在索引容量满后的降级桶使用。
+     */
+    private void collectScan(String bucket, String prefix, String upper, String marker,
+                             TreeMap<String, ObjectMetadata> sink) {
+        for (Drive d : driveManager.getDrives()) {
+            if (!d.isOnline()) continue;
+            File objectsDir = d.objectsDir(bucket);
+            if (!objectsDir.isDirectory()) continue;
+            scanCollect(objectsDir, prefix, upper, marker, sink);
+        }
+    }
+
+    private void scanCollect(File dir, String prefix, String upper, String marker,
+                             TreeMap<String, ObjectMetadata> sink) {
+        File[] cs = dir.listFiles();
+        if (cs == null) return;
+        for (File c : cs) {
+            if (c.isDirectory()) {
+                scanCollect(c, prefix, upper, marker, sink);
+            } else if ("object.meta".equals(c.getName())) {
+                try {
+                    ObjectMetadata m = objectMapper.readValue(c, ObjectMetadata.class);
+                    if (m == null || m.getKey() == null) continue;
+                    String key = m.getKey();
+                    if (prefix != null && !key.startsWith(prefix)) continue;
+                    if (upper != null && key.compareTo(upper) >= 0) continue;
+                    if (marker != null && key.compareTo(marker) <= 0) continue;
+                    sink.merge(key, m, (a, b) -> a.getVersion() >= b.getVersion() ? a : b);
+                } catch (Exception e) {
+                    log.warn("读取对象元信息失败: {}", c, e);
+                }
+            }
+        }
     }
 
     /**
@@ -633,7 +806,15 @@ public class ObjectStore {
         try {
             return objectMapper.readValue(f, ObjectMetadata.class);
         } catch (Exception e) {
-            log.warn("读取对象元信息失败: {}", f, e);
+            // T15：损坏 meta ≠ 不存在——隔离 .corrupt + 告警 + 计数；调用方按显式失败处理
+            // （get/head 映射 500、putPrimary 拒绝覆盖写防 version 重置），不静默当 404
+            corruptedMetaQuarantined.incrementAndGet();
+            log.error("T15 对象元数据损坏，已隔离: {} : {}", f, e.getMessage());
+            File corrupt = new File(f.getParentFile(), f.getName() + ".corrupt."
+                    + System.currentTimeMillis());
+            if (!f.renameTo(corrupt)) {
+                log.error("T15 损坏元数据隔离改名失败（保留原位）: {}", f);
+            }
             return null;
         }
     }
@@ -653,6 +834,67 @@ public class ObjectStore {
 
     private static void safeDelete(File f) {
         if (f != null && f.exists()) f.delete();
+    }
+
+    /** T13：文件 fsync（失败仅告警——个别文件系统不支持）。 */
+    private static void fsyncFileQuietly(File f) {
+        try (FileChannel ch = FileChannel.open(f.toPath(), java.nio.file.StandardOpenOption.WRITE)) {
+            ch.force(true);
+        } catch (IOException e) {
+            log.warn("文件 fsync 失败（忽略）: {}: {}", f, e.getMessage());
+        }
+    }
+
+    /** T13：目录 fsync（Windows 不支持目录 force，异常静默忽略）。 */
+    private static void fsyncDirQuietly(File dir) {
+        try (FileChannel ch = FileChannel.open(dir.toPath(), java.nio.file.StandardOpenOption.READ)) {
+            ch.force(true);
+        } catch (IOException ignored) {
+            // 目录 fsync 在部分平台不可用，静默跳过
+        }
+    }
+
+    /**
+     * T11：崩溃残留清扫——删除各 Drive 上超期的写临时文件
+     * （{@code object.*.tmp}，含 T5 备份文件 {@code object.data.old*.tmp}）。
+     * 年龄阈值防误删在途写；启动时调用一次 + 周期 GC 共用。
+     *
+     * @return 删除的残留文件数
+     */
+    public int sweepTempFiles(long maxAgeMillis) {
+        long deadline = System.currentTimeMillis() - Math.max(0, maxAgeMillis);
+        int removed = 0;
+        for (Drive d : driveManager.getDrives()) {
+            File[] bucketDirs = d.bucketsDir().listFiles();
+            if (bucketDirs == null) continue;
+            for (File bdir : bucketDirs) {
+                if (!bdir.isDirectory()) continue;
+                File objectsDir = new File(bdir, "objects");
+                if (!objectsDir.isDirectory()) continue;
+                removed += sweepTempIn(objectsDir, deadline);
+            }
+        }
+        if (removed > 0) {
+            log.warn("T11 崩溃残留清扫：删除超期临时文件 {} 个（年龄阈值 {} ms）", removed, maxAgeMillis);
+        }
+        return removed;
+    }
+
+    private int sweepTempIn(File dir, long deadline) {
+        int removed = 0;
+        File[] cs = dir.listFiles();
+        if (cs == null) return 0;
+        for (File c : cs) {
+            if (c.isDirectory()) {
+                removed += sweepTempIn(c, deadline);
+            } else if (c.getName().startsWith("object.") && c.getName().endsWith(".tmp")
+                    && c.lastModified() < deadline) {
+                if (c.delete()) {
+                    removed++;
+                }
+            }
+        }
+        return removed;
     }
 
     private static void cleanupEmptyDirs(File leaf, File stopAt) {

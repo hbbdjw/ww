@@ -1,25 +1,36 @@
 package com.ww.runtime.server.config;
 
 import java.io.File;
+import java.util.List;
 import java.util.function.Supplier;
 
 import javax.sql.DataSource;
 
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Primary;
 
 import com.ww.runtime.capability.CapabilityManager;
 import com.ww.runtime.capability.CapabilityStateStore;
+import com.ww.runtime.capability.PlacementView;
 import com.ww.runtime.capability.InMemoryCapabilityStateStore;
 import com.ww.runtime.capability.JdbcCapabilityStateStore;
 import com.ww.runtime.capability.MockCapability;
 import com.ww.runtime.cluster.InMemoryNodeRegistry;
+import com.ww.runtime.cluster.InMemoryNodeSuspicionStore;
 import com.ww.runtime.cluster.JdbcNodeRegistry;
+import com.ww.runtime.cluster.JdbcNodeSuspicionStore;
 import com.ww.runtime.cluster.NodeRegistry;
+import com.ww.runtime.cluster.NodeSuspicionStore;
 import com.ww.runtime.cluster.NodeRuntime;
 import com.ww.runtime.cluster.OsResourceMonitor;
+import com.ww.runtime.cluster.decommission.DecommissionStore;
+import com.ww.runtime.cluster.decommission.InMemoryDecommissionStore;
+import com.ww.runtime.cluster.decommission.JdbcDecommissionStore;
+import com.ww.runtime.common.CapabilityType;
 import com.ww.runtime.common.Clock;
 import com.ww.runtime.common.NodeId;
 import com.ww.runtime.common.NodeState;
@@ -30,9 +41,11 @@ import com.ww.runtime.data.cache.CachePartitionAdapter;
 import com.ww.runtime.data.storage.StorageCapability;
 import com.ww.runtime.data.storage.StoragePartitionAdapter;
 import com.ww.runtime.grpc.GrpcServerHost;
+import com.ww.runtime.membership.MemberEvent;
 import com.ww.runtime.membership.MembershipService;
 import com.ww.runtime.membership.PeerDirectory;
 import com.ww.runtime.membership.StateSink;
+import com.ww.runtime.membership.SuspicionSink;
 import com.ww.runtime.migration.InMemoryMigrationTaskStore;
 import com.ww.runtime.migration.JdbcMigrationTaskStore;
 import com.ww.runtime.migration.MigrationEngine;
@@ -46,6 +59,7 @@ import com.ww.runtime.placement.Partitioner;
 import com.ww.runtime.placement.PlacementEngine;
 import com.ww.runtime.placement.PlacementStore;
 import com.ww.runtime.placement.RebalancePlanner;
+import com.ww.runtime.scheduler.DecommissionDriver;
 import com.ww.runtime.scheduler.DesiredStateWriter;
 import com.ww.runtime.scheduler.GrpcNodeCommandChannel;
 import com.ww.runtime.scheduler.InMemoryLeaseStore;
@@ -54,9 +68,14 @@ import com.ww.runtime.scheduler.LeaseStore;
 import com.ww.runtime.scheduler.LocalNodeCommandChannel;
 import com.ww.runtime.scheduler.ReconcileLoop;
 import com.ww.runtime.server.RuntimeProperties;
+import com.ww.runtime.server.cluster.CachedClusterDirectory;
+import com.ww.runtime.server.decommission.DecommissionService;
+import com.ww.runtime.server.decommission.RuntimeDecommissionCoordinator;
 import com.ww.runtime.server.grpc.ClusterControlServer;
 import com.ww.runtime.server.grpc.HealthServer;
 import com.ww.runtime.server.migration.RuntimeMigrationCoordinator;
+import com.ww.runtime.server.placement.CachedPlacementView;
+import com.ww.runtime.server.placement.PartitionLeaseManager;
 import com.ww.runtime.server.placement.PlacementViewAdapter;
 
 /**
@@ -76,6 +95,9 @@ import com.ww.runtime.server.placement.PlacementViewAdapter;
 @Configuration
 public class RuntimeAssembly {
 
+    private static final org.slf4j.Logger LOG =
+            org.slf4j.LoggerFactory.getLogger(RuntimeAssembly.class);
+
     // ------------------------------------------------------------------
     // 基础设施
     // ------------------------------------------------------------------
@@ -91,10 +113,31 @@ public class RuntimeAssembly {
         return NodeId.of(props.node().id());
     }
 
+    /**
+     * S19：gRPC 服务端有界执行器——默认 cached 线程池无界，控制面钩子（能力 start/stop）
+     * 卡死会拖出线程膨胀；命名有界池（8 核心/64 上限/队列 1024），拒绝由 grpc 回压。
+     */
+    @Bean(name = "grpcServerExecutor", destroyMethod = "shutdown")
+    java.util.concurrent.ThreadPoolExecutor grpcServerExecutor() {
+        java.util.concurrent.ThreadPoolExecutor pool = new java.util.concurrent.ThreadPoolExecutor(
+                8, 64, 60L, java.util.concurrent.TimeUnit.SECONDS,
+                new java.util.concurrent.LinkedBlockingQueue<>(1024),
+                r -> {
+                    Thread t = new Thread(r, "grpc-server-worker");
+                    t.setDaemon(true);
+                    return t;
+                });
+        pool.allowCoreThreadTimeOut(true);
+        return pool;
+    }
+
     /** gRPC 宿主：服务注册（addService）与端口绑定（start）的顺序约束由 RuntimeBootstrapper 编排。 */
     @Bean
-    GrpcServerHost grpcServerHost() {
-        return new GrpcServerHost();
+    GrpcServerHost grpcServerHost(
+            @org.springframework.beans.factory.annotation.Qualifier("grpcServerExecutor")
+            java.util.concurrent.ThreadPoolExecutor grpcServerExecutor) {
+        // S19：统一挂载有界执行器（控制面/数据面共用宿主）
+        return new GrpcServerHost().setExecutor(grpcServerExecutor);
     }
 
     /** OS 资源采样：CPU/内存取系统 MXBean，磁盘采样当前工作目录所在卷。 */
@@ -121,7 +164,8 @@ public class RuntimeAssembly {
      * 保证 {@code membershipService.start()} 先于 {@code nodeRuntime.start()}
      * （后者内部执行 {@code host.start(port)}）。</p>
      *
-     * <p>端口适配：PeerDirectory=registry.listAlive() 排除 self；StateSink=registry.markState；
+     * <p>端口适配：PeerDirectory=registry.listAlive() 排除 self；StateSink=registry.markState
+     * （S12 纪元防护：他报回写比较注册表 state_epoch，陈旧决定丢弃；直证自报豁免）；
      * selfInfo=优先注册表当前视图（含最新 stateEpoch/状态），未注册（启动早期）用本地信息兜底。</p>
      */
     @Bean
@@ -130,6 +174,8 @@ public class RuntimeAssembly {
                                         GrpcServerHost host,
                                         NodeRuntime nodeRuntime,
                                         OsResourceMonitor monitor,
+                                        GrpcNodeCommandChannel grpcNodeCommandChannel,
+                                        NodeSuspicionStore suspicionStore,
                                         RuntimeProperties props,
                                         Clock clock) {
         Supplier<com.ww.runtime.common.NodeInfo> selfInfo = () -> registry.get(self)
@@ -139,17 +185,67 @@ public class RuntimeAssembly {
         PeerDirectory peerDirectory = () -> registry.listAlive().stream()
                 .filter(info -> !info.id().equals(self))
                 .toList();
-        // 同态幂等：注册表已是目标态时跳过 markState（状态机禁止同态跃迁，若直接调用会因
-        // gossip 视图抖动反复抛 IllegalStateTransitionException，产生大量 WARN 噪声）
-        StateSink stateSink = (id, state) -> {
-            NodeState current = registry.get(id).map(com.ww.runtime.common.NodeInfo::state).orElse(null);
-            if (current == state) {
-                return;
+        StateSink stateSink = new StateSink() {
+            @Override
+            public void apply(NodeId id, NodeState newState) {
+                apply(id, newState, -1L, false);
             }
-            registry.markState(id, state);
+
+            @Override
+            public void apply(NodeId id, NodeState newState, long observedEpoch, boolean directEvidence) {
+                com.ww.runtime.common.NodeInfo current = registry.get(id).orElse(null);
+                if (current == null) {
+                    return; // 注册表已无此行（被清理），无需回写
+                }
+                // S12 纪元防护：判定基于 observedEpoch 的视图；注册表已推进（更高纪元=更新的
+                // 事实，含重新注册/他实例回写）则本条为陈旧决定，丢弃。
+                // 豁免：直证自报——节点自身是自身状态的绝对权威，且重新注册会重置纪元，
+                // 按数字比较会把合法复活一并拦死（红线：防护不拦自报）。
+                if (!directEvidence && observedEpoch >= 0 && current.stateEpoch() > observedEpoch) {
+                    LOG.warn("S12: stale state write-back dropped for {} -> {} "
+                                    + "(observedEpoch={} < registryEpoch={})",
+                            id, newState, observedEpoch, current.stateEpoch());
+                    return;
+                }
+                // 同态幂等：注册表已是目标态时跳过 markState（状态机禁止同态跃迁，若直接调用会因
+                // gossip 视图抖动反复抛 IllegalStateTransitionException，产生大量 WARN 噪声）
+                if (current.state() == newState) {
+                    return;
+                }
+                registry.markState(id, newState);
+            }
         };
-        return new MembershipService(self, selfInfo, peerDirectory, stateSink, host,
-                props.toMembershipConfig(), clock);
+        // 多级仲裁桥接：membership 只产出"本节点对 peer 的怀疑票"，票表在共享注册表，
+        // 由 leader ReconcileLoop 计票达法定人数后唯一提升 DEAD（PFAIL→FAIL）。
+        SuspicionSink suspicionSink = new SuspicionSink() {
+            @Override
+            public void vote(NodeId suspect, double phi) {
+                try {
+                    suspicionStore.vote(suspect, self, phi);
+                } catch (RuntimeException e) {
+                    LOG.warn("suspicion vote failed for {} by {}: {}", suspect, self, e.toString());
+                }
+            }
+
+            @Override
+            public void recall(NodeId suspect) {
+                try {
+                    suspicionStore.recall(suspect, self);
+                } catch (RuntimeException e) {
+                    LOG.debug("suspicion recall failed for {} by {}: {}", suspect, self, e.toString());
+                }
+            }
+        };
+        MembershipService service = new MembershipService(self, selfInfo, peerDirectory, stateSink,
+                host, props.toMembershipConfig(), clock, suspicionSink);
+        // A3：成员事件驱动驱逐已下线节点的命令通道（通道缓存不再随节点历史单调增长）；
+        // 节点复活后调度器重新下发命令时通道按 target 自动重建
+        service.addListener(event -> {
+            if (MemberEvent.NODE_DEAD.equals(event.type())) {
+                grpcNodeCommandChannel.evictNode(event.node().id());
+            }
+        });
+        return service;
     }
 
     // ------------------------------------------------------------------
@@ -191,9 +287,12 @@ public class RuntimeAssembly {
                             NodeRegistry registry,
                             GrpcServerHost host,
                             OsResourceMonitor monitor,
-                            Clock clock) {
+                            Clock clock,
+                            @Value("${server.port:8080}") int httpPort) {
         return new NodeRuntime(self, props.node().host(), props.node().grpcPort(),
-                props.node().weight(), registry, host, monitor, clock, props.heartbeatIntervalMs());
+                httpPort, props.node().weight(), registry, host, monitor, clock,
+                props.heartbeatIntervalMs())
+                .withZone(props.node().zone());
     }
 
     // ------------------------------------------------------------------
@@ -210,16 +309,61 @@ public class RuntimeAssembly {
         return new RebalancePlanner();
     }
 
-    /** capability 的 PlacementView 端口适配：placement 行 → Owner(node, epoch)。 */
+    /**
+     * 数据面 placement 视图：
+     * cache=本地修订快照 + 本地租约（Phase 1+2，默认）；db=每次查库（回滚开关）。
+     */
     @Bean
-    PlacementViewAdapter placementViewAdapter(PlacementStore placementStore) {
-        return new PlacementViewAdapter(placementStore);
+    @Primary
+    PlacementView dataPlacementView(RuntimeProperties props,
+                                    PlacementStore placementStore,
+                                    CachedPlacementView cachedPlacementView) {
+        if ("db".equals(props.route().mode())) {
+            return new PlacementViewAdapter(placementStore);
+        }
+        return cachedPlacementView;
+    }
+
+    /** 放置本地快照：后台轮询修订号，数据面读写只查内存。 */
+    @Bean
+    CachedPlacementView cachedPlacementView(PlacementStore placementStore,
+                                            Clock clock,
+                                            RuntimeProperties props) {
+        return new CachedPlacementView(placementStore, clock,
+                props.route().viewRefreshMs(),
+                props.route().fullRefreshMs(),
+                props.fence().safetyMarginMs());
+    }
+
+    /** 本地写租约：后台批量续约，写路径只校验内存有效期。 */
+    @Bean
+    PartitionLeaseManager partitionLeaseManager(PlacementStore placementStore,
+                                                CachedPlacementView cachedPlacementView,
+                                                NodeId self,
+                                                Clock clock,
+                                                RuntimeProperties props) {
+        return new PartitionLeaseManager(placementStore, cachedPlacementView, self, clock,
+                props.fence().leaseTtlMs(),
+                props.fence().leaseRenewMs(),
+                props.fence().safetyMarginMs(),
+                props.fence().leaseBatchSize(),
+                "cache".equals(props.route().mode()));
+    }
+
+    /** 节点端点/能力 serving 集合缓存：数据面 fan-out 与转发不再同步查注册表。 */
+    @Bean
+    CachedClusterDirectory cachedClusterDirectory(NodeRegistry registry,
+                                                  CapabilityStateStore capabilityStateStore,
+                                                  RuntimeProperties props) {
+        return new CachedClusterDirectory(registry, capabilityStateStore,
+                props.route().directoryRefreshMs(),
+                "cache".equals(props.route().mode()));
     }
 
     /** Mock 能力（fencing 演示 + 迁移数据面），key→分区映射与调度器同口径。 */
     @Bean
     MockCapability mockCapability(NodeId self,
-                                  PlacementViewAdapter placementView,
+                                  PlacementView placementView,
                                   RuntimeProperties props) {
         return new MockCapability(self, placementView,
                 key -> Partitioner.partition(key, props.partitionCount()));
@@ -234,39 +378,192 @@ public class RuntimeAssembly {
     // 数据面能力：CACHE（SimpleCache 包装）与 STORAGE（ObjectStore 包装）
     // ------------------------------------------------------------------
 
-    /** CACHE 能力：分区口径与调度器一致（Partitioner）；AOF 目录/开关来自 capabilities 配置。 */
+    /** CACHE 能力：分区口径与调度器一致（Partitioner）；AOF 目录/开关/重写缓冲上限来自 capabilities 配置。 */
     @Bean
     CacheCapability cacheCapability(NodeId self,
-                                    PlacementViewAdapter placementView,
+                                    PlacementView placementView,
                                     RuntimeProperties props) {
         return new CacheCapability(self, placementView,
                 key -> Partitioner.partition(key, props.partitionCount()),
                 props.capabilities().cacheAofEnabled(),
-                new File(props.capabilities().cacheDataDir()));
+                new File(props.capabilities().cacheDataDir()),
+                props.capabilities().cacheAofRewriteBufferMaxBytes())
+                .withCapacityLimits(
+                        props.capabilities().cacheMaxSize(),
+                        props.capabilities().cacheStreamMaxLen(),
+                        props.capabilities().cachePelMaxEntries(),
+                        props.capabilities().cacheMaxStreams(),
+                        props.capabilities().cacheMaxMemoryBytes());
     }
 
-    /** STORAGE 本地配置：runtime.capabilities.storage-* 映射为 common/storage 的 StorageProperties。 */
+    /** STORAGE 本地配置：runtime.capabilities.storage-* 映射为 storage 引擎的 StorageProperties。 */
     @Bean
-    com.ww.storage.StorageProperties storageProperties(RuntimeProperties props) {
-        com.ww.storage.StorageProperties sp = new com.ww.storage.StorageProperties();
+    com.ww.runtime.data.storage.engine.StorageProperties storageProperties(RuntimeProperties props) {
+        com.ww.runtime.data.storage.engine.StorageProperties sp = new com.ww.runtime.data.storage.engine.StorageProperties();
         String drives = props.capabilities().storageDrives();
         if (drives != null && !drives.isBlank()) {
             sp.setDrives(java.util.Arrays.stream(drives.split(","))
                     .map(String::trim).filter(s -> !s.isEmpty()).toList());
         }
         sp.setRootDir(props.capabilities().storageDataDir());
+        sp.setMaxObjectSize(props.capabilities().storageMaxObjectSize());
+        sp.setMetadataIndexMaxEntries(props.capabilities().storageMetadataIndexMaxEntries());
+        sp.setImportStagingMaxAggregates(props.capabilities().storageImportStagingMaxAggregates());
+        sp.setImportStagingTimeoutMinutes(props.capabilities().storageImportStagingTimeoutMinutes());
+        // P0-1 半同步复制（默认关；开启后主写落盘须等 ≥1 副本确认才应答）
+        sp.setSemiSyncEnabled(props.capabilities().storageSemiSyncEnabled());
+        sp.setSemiSyncTimeoutMs(props.capabilities().storageSemiSyncTimeoutMs());
+        sp.setSemiSyncFailClosed(props.capabilities().storageSemiSyncFailClosed());
         return sp;
+    }
+
+    /**
+     * P0-2 分区隔离数据面视图：DegradedPartitionStore 的 TTL 内存快照，
+     * 注入 Storage/Cache 网关热路径（@PostConstruct 启动周期刷新）。
+     */
+    @Bean
+    com.ww.runtime.server.degraded.DegradedPartitionCache degradedPartitionCache(
+            com.ww.runtime.placement.DegradedPartitionStore degradedPartitionStore) {
+        return new com.ww.runtime.server.degraded.DegradedPartitionCache(degradedPartitionStore);
     }
 
     /** STORAGE 能力：节点内 Set/Drive 分片仍由 SetLocator 负责，节点间分区归 runtime placement。 */
     @Bean
     StorageCapability storageCapability(NodeId self,
-                                        PlacementViewAdapter placementView,
+                                        PlacementView placementView,
                                         RuntimeProperties props,
-                                        com.ww.storage.StorageProperties storageProperties) {
+                                        com.ww.runtime.data.storage.engine.StorageProperties storageProperties) {
         return new StorageCapability(self, placementView,
                 bucketSlashKey -> Partitioner.partition(bucketSlashKey, props.partitionCount()),
                 storageProperties, props.toMigrationConfig().chunkSize());
+    }
+
+    // ------------------------------------------------------------------
+    // STORAGE 数据面：gRPC 服务端/客户端 + 副本复制器 + 网关
+    // ------------------------------------------------------------------
+
+    /** 对等节点目录端口适配：本地目录快照 → gRPC 数据面端点（热路径不查库）。 */
+    @Bean
+    com.ww.runtime.data.storage.StoragePeerDirectory storagePeerDirectory(
+            CachedClusterDirectory directory) {
+        return new com.ww.runtime.data.storage.StoragePeerDirectory() {
+            @Override
+            public java.util.Optional<PeerEndpoint> endpoint(NodeId node) {
+                return directory.endpoint(node)
+                        .map(info -> new PeerEndpoint(info.host(), info.grpcPort()));
+            }
+
+            @Override
+            public java.util.List<NodeId> alivePeers() {
+                return directory.alivePeers();
+            }
+
+            @Override
+            public List<NodeId> servingPeers() {
+                return directory.servingPeers(CapabilityType.STORAGE);
+            }
+        };
+    }
+
+    /** 存储 gRPC 客户端：网关转发/复制/fan-out 列举共用（通道按 target 缓存）。 */
+    @Bean
+    com.ww.runtime.data.storage.StorageGrpcClient storageGrpcClient(
+            com.ww.runtime.data.storage.StoragePeerDirectory directory) {
+        return new com.ww.runtime.data.storage.StorageGrpcClient(directory);
+    }
+
+    /** 存储 gRPC 服务端：ForwardPut/Get/Head/Delete + Replicate* + ListBucket + SyncBucket。 */
+    @Bean
+    com.ww.runtime.data.storage.StorageGrpcServer storageGrpcServer(StorageCapability capability,
+                                                                    RuntimeProperties props) {
+        return new com.ww.runtime.data.storage.StorageGrpcServer(capability,
+                props.toMigrationConfig().chunkSize());
+    }
+
+    /** 副本复制器：写后异步复制 + backlog 重放 + 周期对账（start/stop 由 Bootstrapper 编排）。 */
+    @Bean
+    com.ww.runtime.data.storage.StorageReplicator storageReplicator(NodeId self,
+                                                                    PlacementView placementView,
+                                                                    StorageCapability capability,
+                                                                    com.ww.runtime.data.storage.StorageGrpcClient client,
+                                                                    com.ww.runtime.data.storage.StoragePeerDirectory directory,
+                                                                    com.ww.runtime.data.storage.StorageGateway gateway,
+                                                                    RuntimeProperties props) {
+        com.ww.runtime.data.storage.StorageReplicator replicator =
+                new com.ww.runtime.data.storage.StorageReplicator(self, placementView,
+                        bucketSlashKey -> Partitioner.partition(bucketSlashKey, props.partitionCount()),
+                        capability, client, directory);
+        // T21：周期桶对账（fan-out 比差 + 缺失补建），随 replicator 调度器运行
+        replicator.setBucketReconciler(gateway::reconcileBuckets);
+        return replicator;
+    }
+
+    /** STORAGE 网关：REST 层按 placement 自动路由（本地/转发），fan-out 列举与桶广播。 */
+    @Bean
+    com.ww.runtime.data.storage.StorageGateway storageGateway(NodeId self,
+                                                              PlacementView placementView,
+                                                              StorageCapability capability,
+                                                              com.ww.runtime.data.storage.StorageGrpcClient client,
+                                                              com.ww.runtime.data.storage.StoragePeerDirectory directory,
+                                                              RuntimeProperties props,
+                                                              com.ww.runtime.server.degraded.DegradedPartitionCache degradedCache) {
+        return new com.ww.runtime.data.storage.StorageGateway(self, placementView,
+                bucketSlashKey -> Partitioner.partition(bucketSlashKey, props.partitionCount()),
+                capability, client, directory, degradedCache);
+    }
+
+    // ------------------------------------------------------------------
+    // CACHE 数据面：gRPC 服务端/客户端 + 网关（对齐 STORAGE 数据面装配）
+    // ------------------------------------------------------------------
+
+    /** 缓存对等节点目录端口适配：本地目录快照 → gRPC 数据面端点（热路径不查库）。 */
+    @Bean
+    com.ww.runtime.data.cache.CachePeerDirectory cachePeerDirectory(
+            CachedClusterDirectory directory) {
+        return new com.ww.runtime.data.cache.CachePeerDirectory() {
+            @Override
+            public java.util.Optional<PeerEndpoint> endpoint(NodeId node) {
+                return directory.endpoint(node)
+                        .map(info -> new PeerEndpoint(info.host(), info.grpcPort()));
+            }
+
+            @Override
+            public java.util.List<NodeId> alivePeers() {
+                return directory.alivePeers();
+            }
+
+            @Override
+            public List<NodeId> servingPeers() {
+                return directory.servingPeers(CapabilityType.CACHE);
+            }
+        };
+    }
+
+    /** 缓存 gRPC 客户端：网关转发（通道按 target 缓存）。 */
+    @Bean
+    com.ww.runtime.data.cache.CacheGrpcClient cacheGrpcClient(
+            com.ww.runtime.data.cache.CachePeerDirectory directory) {
+        return new com.ww.runtime.data.cache.CacheGrpcClient(directory);
+    }
+
+    /** 缓存 gRPC 服务端：ForwardPut/Get/Delete（属主端 fencing 生效）。 */
+    @Bean
+    com.ww.runtime.data.cache.CacheGrpcServer cacheGrpcServer(CacheCapability capability) {
+        return new com.ww.runtime.data.cache.CacheGrpcServer(capability);
+    }
+
+    /** CACHE 网关：REST 层按 placement 自动路由（本地/转发），fan-out 列举/计数，客户端无需感知拓扑。 */
+    @Bean
+    com.ww.runtime.data.cache.CacheGateway cacheGateway(NodeId self,
+                                                        PlacementView placementView,
+                                                        CacheCapability capability,
+                                                        com.ww.runtime.data.cache.CacheGrpcClient client,
+                                                        com.ww.runtime.data.cache.CachePeerDirectory directory,
+                                                        RuntimeProperties props,
+                                                        com.ww.runtime.server.degraded.DegradedPartitionCache degradedCache) {
+        return new com.ww.runtime.data.cache.CacheGateway(self, placementView,
+                key -> Partitioner.partition(key, props.partitionCount()),
+                capability, client, directory, degradedCache);
     }
 
     @Bean
@@ -288,6 +585,36 @@ public class RuntimeAssembly {
                 "MOCK", (PartitionDataAdapter) mock,
                 "CACHE", cache,
                 "STORAGE", storage));
+    }
+
+    /**
+     * 节点感知路由适配器：迁移引擎经它按任务 source/target 把数据面调用路由到
+     * 「本地组合适配器 | 远端节点」——跨节点数据搬迁的核心接线（能力无关）。
+     * resolver 从 NodeRegistry 解析 ACTIVE 节点的 gRPC 端点。
+     */
+    @Bean
+    com.ww.runtime.migration.RoutingPartitionAdapter routingPartitionAdapter(
+            CompositePartitionAdapter composite,
+            NodeId self,
+            NodeRegistry registry) {
+        return new com.ww.runtime.migration.RoutingPartitionAdapter(composite, self,
+                node -> registry.get(node)
+                        .filter(info -> info.state() == NodeState.ACTIVE)
+                        .map(info -> new com.ww.runtime.migration.RoutingPartitionAdapter.Endpoint(
+                                info.host(), info.grpcPort())));
+    }
+
+    /** 启动清扫器：放置表引导后裁剪本机各能力的非属主分区数据（能力无关）。
+     * P0-2：DEGRADED 隔离分区（死亡属主页上的最后副本）纳入保留规则，绝不误删。 */
+    @Bean
+    com.ww.runtime.server.cache.PartitionSweeper partitionSweeper(
+            CompositePartitionAdapter composite,
+            com.ww.runtime.placement.PlacementStore placementStore,
+            com.ww.runtime.migration.MigrationTaskStore migrationTaskStore,
+            NodeId self,
+            com.ww.runtime.placement.DegradedPartitionStore degradedPartitionStore) {
+        return new com.ww.runtime.server.cache.PartitionSweeper(
+                composite, placementStore, migrationTaskStore, self, degradedPartitionStore);
     }
 
     @Bean
@@ -318,7 +645,7 @@ public class RuntimeAssembly {
 
     @Bean
     MigrationEngine migrationEngine(MigrationTaskStore store,
-                                    CompositePartitionAdapter adapter,
+                                    com.ww.runtime.migration.RoutingPartitionAdapter adapter,
                                     PlacementStore placementStore,
                                     RuntimeProperties props,
                                     Clock clock) {
@@ -341,16 +668,52 @@ public class RuntimeAssembly {
                                 RebalancePlanner planner,
                                 GrpcNodeCommandChannel commands,
                                 RuntimeMigrationCoordinator migration,
+                                DecommissionDriver decommission,
+                                NodeSuspicionStore suspicionStore,
+                                com.ww.runtime.placement.DegradedPartitionStore degradedPartitionStore,
                                 RuntimeProperties props,
                                 Clock clock) {
         return new ReconcileLoop(self, leaseStore, registry, capabilityStore, placementStore,
-                engine, planner, commands, migration, props.toSchedulerConfig(), clock);
+                engine, planner, commands, migration, decommission, props.toSchedulerConfig(), clock,
+                suspicionStore, degradedPartitionStore);
     }
 
     /** 期望态写入器（§60：管理面只写期望态，含清空最后 ACTIVE 节点保护）。 */
     @Bean
     DesiredStateWriter desiredStateWriter(CapabilityStateStore store) {
         return new DesiredStateWriter(store);
+    }
+
+    /** 退役流程编排器（由 ReconcileLoop 每周期驱动）。 */
+    @Bean
+    RuntimeDecommissionCoordinator runtimeDecommissionCoordinator(DecommissionStore decommissionStore,
+                                                                   NodeRegistry registry,
+                                                                   CapabilityStateStore capabilityStore,
+                                                                   PlacementStore placementStore,
+                                                                   PlacementEngine engine,
+                                                                   RuntimeProperties props,
+                                                                   Clock clock) {
+        return new RuntimeDecommissionCoordinator(decommissionStore, registry, capabilityStore,
+                placementStore, engine, props.toSchedulerConfig(), clock);
+    }
+
+    /** 退役准入与预检服务（REST 端点调用）。 */
+    @Bean
+    DecommissionService decommissionService(NodeRegistry registry,
+                                            CapabilityStateStore capabilityStore,
+                                            PlacementStore placementStore,
+                                            DesiredStateWriter desiredStateWriter,
+                                            DecommissionStore decommissionStore,
+                                            CacheCapability cacheCapability,
+                                            com.ww.runtime.data.cache.CacheGrpcClient cacheGrpcClient,
+                                            StorageCapability storageCapability,
+                                            com.ww.runtime.data.storage.StorageGrpcClient storageGrpcClient,
+                                            MigrationTaskStore migrationTaskStore,
+                                            NodeId self,
+                                            Clock clock) {
+        return new DecommissionService(registry, capabilityStore, placementStore, desiredStateWriter,
+                decommissionStore, cacheCapability, cacheGrpcClient, storageCapability, storageGrpcClient,
+                migrationTaskStore, self, clock);
     }
 
     // ------------------------------------------------------------------
@@ -373,15 +736,26 @@ public class RuntimeAssembly {
                                             MockCapability mockCapability,
                                             CacheCapability cacheCapability,
                                             StorageCapability storageCapability,
+                                            com.ww.runtime.data.cache.CacheGrpcServer cacheGrpcServer,
+                                            com.ww.runtime.data.cache.CacheGrpcClient cacheGrpcClient,
+                                            com.ww.runtime.data.storage.StorageGrpcServer storageGrpcServer,
+                                            com.ww.runtime.data.storage.StorageReplicator storageReplicator,
+                                            com.ww.runtime.data.storage.StorageGrpcClient storageGrpcClient,
                                             DesiredStateWriter desiredStateWriter,
                                             GrpcNodeCommandChannel grpcCommandChannel,
                                             MigrationEngine migrationEngine,
-                                            ReconcileLoop reconcileLoop) {
+                                            ReconcileLoop reconcileLoop,
+                                            com.ww.runtime.server.cache.PartitionSweeper partitionSweeper,
+                                            com.ww.runtime.migration.RoutingPartitionAdapter routingPartitionAdapter,
+                                            com.ww.runtime.server.security.RbacSeeder rbacSeeder,
+                                            com.ww.runtime.server.lb.LbRefresher lbRefresher) {
         return new RuntimeBootstrapper(dataSource, props, self, grpcHost, membershipService,
                 migrationServer, clusterControlServer, healthServer, logStreamGrpcServer, nodeRuntime,
                 capabilityManager, capabilityStateStore, mockCapability, cacheCapability, storageCapability,
+                cacheGrpcServer, cacheGrpcClient, storageGrpcServer, storageReplicator, storageGrpcClient,
                 desiredStateWriter, grpcCommandChannel,
-                migrationEngine, reconcileLoop);
+                migrationEngine, reconcileLoop, partitionSweeper, routingPartitionAdapter, rbacSeeder,
+                lbRefresher);
     }
 
     // ------------------------------------------------------------------
@@ -409,6 +783,11 @@ public class RuntimeAssembly {
         }
 
         @Bean
+        com.ww.runtime.placement.JdbcDegradedPartitionStore degradedPartitionStore(DataSource dataSource) {
+            return new com.ww.runtime.placement.JdbcDegradedPartitionStore(dataSource);
+        }
+
+        @Bean
         JdbcLeaseStore leaseStore(DataSource dataSource, Clock clock) {
             return new JdbcLeaseStore(dataSource, clock);
         }
@@ -416,6 +795,16 @@ public class RuntimeAssembly {
         @Bean
         JdbcMigrationTaskStore migrationTaskStore(DataSource dataSource, Clock clock) {
             return new JdbcMigrationTaskStore(dataSource, clock);
+        }
+
+        @Bean
+        JdbcDecommissionStore decommissionStore(DataSource dataSource, Clock clock) {
+            return new JdbcDecommissionStore(dataSource, clock);
+        }
+
+        @Bean
+        JdbcNodeSuspicionStore nodeSuspicionStore(DataSource dataSource, Clock clock) {
+            return new JdbcNodeSuspicionStore(dataSource, clock);
         }
     }
 
@@ -440,6 +829,11 @@ public class RuntimeAssembly {
         }
 
         @Bean
+        com.ww.runtime.placement.InMemoryDegradedPartitionStore degradedPartitionStore() {
+            return new com.ww.runtime.placement.InMemoryDegradedPartitionStore();
+        }
+
+        @Bean
         InMemoryLeaseStore leaseStore(Clock clock) {
             return new InMemoryLeaseStore(clock);
         }
@@ -447,6 +841,16 @@ public class RuntimeAssembly {
         @Bean
         InMemoryMigrationTaskStore migrationTaskStore(Clock clock) {
             return new InMemoryMigrationTaskStore(clock);
+        }
+
+        @Bean
+        InMemoryDecommissionStore decommissionStore(Clock clock) {
+            return new InMemoryDecommissionStore(clock);
+        }
+
+        @Bean
+        InMemoryNodeSuspicionStore nodeSuspicionStore(Clock clock) {
+            return new InMemoryNodeSuspicionStore(clock);
         }
     }
 }

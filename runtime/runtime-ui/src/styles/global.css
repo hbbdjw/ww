@@ -1,0 +1,268 @@
+@import "tailwindcss";
+
+/* 让 tailwind 的 dark: 变体贴 html.dark 类（与应用内主题切换一致，而非系统偏好） */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* ==================================================================
+ * WW Runtime 设计令牌（浅色 / 深色双主题）
+ * 所有自定义（非 naive-ui）组件统一引用 --ww-* 变量，
+ * 解决 Teleport 到 body 后无法继承 naive 组件局部 --n-* 变量的问题。
+ * ================================================================== */
+:root {
+  /* 背景层级：页面底 → 卡片 → 抬升弹层（modal/popover）→ 内嵌凹陷区 */
+  --ww-bg: #f4f6fa;
+  --ww-surface: #ffffff;
+  --ww-surface-modal: #ffffff;
+  --ww-surface-2: #f6f8fb;
+  --ww-surface-hover: rgba(17, 24, 39, 0.05);
+  --ww-surface-active: rgba(24, 160, 88, 0.1);
+
+  /* 线条 */
+  --ww-border: #e6e9f0;
+  --ww-border-strong: #d4d9e3;
+  --ww-divider: rgba(17, 24, 39, 0.07);
+
+  /* 文字三级 */
+  --ww-text-1: #1d2129;
+  --ww-text-2: #4e5969;
+  --ww-text-3: #86909c;
+
+  /* 主色（运行时由 useTheme 按预设覆盖） */
+  --ww-primary: #18a058;
+  --ww-primary-hover: #36ad6a;
+  --ww-primary-pressed: #0c7a43;
+  --ww-primary-soft: rgba(24, 160, 88, 0.12);
+  --ww-primary-soft-hover: rgba(24, 160, 88, 0.2);
+
+  /* 阴影 */
+  --ww-shadow-popover: 0 8px 28px rgba(20, 28, 40, 0.12), 0 2px 8px rgba(20, 28, 40, 0.06);
+  --ww-shadow-modal: 0 24px 64px rgba(20, 28, 40, 0.22), 0 6px 18px rgba(20, 28, 40, 0.1);
+  --ww-shadow-float: 0 4px 14px rgba(20, 28, 40, 0.12);
+
+  /* 遮罩 */
+  --ww-mask: rgba(17, 22, 31, 0.45);
+
+  /* 圆角 */
+  --ww-radius-sm: 6px;
+  --ww-radius: 8px;
+  --ww-radius-lg: 10px;
+
+  color-scheme: light;
+}
+
+html.dark {
+  --ww-bg: #0f1115;
+  --ww-surface: #18181c;
+  /* 与 naive-ui darkTheme 的 modalColor 对齐：弹层比卡片更亮，表达抬升层级 */
+  --ww-surface-modal: #2c2c32;
+  --ww-surface-2: #232328;
+  --ww-surface-hover: rgba(255, 255, 255, 0.06);
+  --ww-surface-active: rgba(24, 160, 88, 0.16);
+
+  --ww-border: rgba(255, 255, 255, 0.09);
+  --ww-border-strong: rgba(255, 255, 255, 0.16);
+  --ww-divider: rgba(255, 255, 255, 0.08);
+
+  --ww-text-1: rgba(255, 255, 255, 0.92);
+  --ww-text-2: rgba(255, 255, 255, 0.62);
+  --ww-text-3: rgba(255, 255, 255, 0.38);
+
+  --ww-primary-soft: rgba(54, 173, 106, 0.18);
+  --ww-primary-soft-hover: rgba(54, 173, 106, 0.28);
+
+  --ww-shadow-popover: 0 8px 28px rgba(0, 0, 0, 0.5), 0 2px 8px rgba(0, 0, 0, 0.35);
+  --ww-shadow-modal: 0 24px 64px rgba(0, 0, 0, 0.6), 0 6px 18px rgba(0, 0, 0, 0.4);
+  --ww-shadow-float: 0 4px 14px rgba(0, 0, 0, 0.5);
+
+  --ww-mask: rgba(0, 0, 0, 0.62);
+
+  color-scheme: dark;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body, #app {
+  height: 100%;
+  width: 100%;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'Hiragino Sans GB', 'Microsoft YaHei', 'Helvetica Neue', Arial, sans-serif;
+  font-size: 14px;
+  color: var(--ww-text-1);
+  background: var(--ww-bg);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+.mono {
+  font-family: ui-monospace, 'JetBrains Mono', SFMono-Regular, Menlo, Consolas,
+    'Liberation Mono', monospace;
+}
+
+::selection {
+  background: var(--ww-primary-soft-hover);
+}
+
+/* ==================================================================
+ * 滚动条：跟随主题的细线风格（原生滚动条区域 + 自定义容器通用）
+ * ================================================================== */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--ww-border-strong) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: var(--ww-border-strong);
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--ww-text-3);
+  background-clip: padding-box;
+  border: 2px solid transparent;
+}
+
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* 统计卡片后缀（NTag/文字）与数值基线对齐 */
+.n-statistic-value .n-statistic-value__suffix {
+  display: inline-flex;
+  align-items: baseline;
+}
+
+.fade-enter-active, .fade-leave-active {
+  transition: opacity 0.15s ease;
+}
+
+.fade-enter-from, .fade-leave-to {
+  opacity: 0;
+}
+
+/* 路由面板：纯 CSS 入场淡入（不介入组件挂载时序，替代有空白风险的 transition out-in） */
+.route-pane {
+  height: 100%;
+  animation: route-fade-in 0.18s ease;
+}
+
+@keyframes route-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* ==================================================================
+ * 语义化辅助类：供不便使用主题令牌的模板内文字/背景使用
+ * ================================================================== */
+.ww-text-1 { color: var(--ww-text-1); }
+.ww-text-2 { color: var(--ww-text-2); }
+.ww-text-3 { color: var(--ww-text-3); }
+.ww-surface { background: var(--ww-surface); }
+.ww-surface-2 { background: var(--ww-surface-2); }
+.ww-border-b { border-bottom: 1px solid var(--ww-border); }
+.ww-border-t { border-top: 1px solid var(--ww-border); }
+
+/* ==================================================================
+ * CodeMirror 6 暗色适配（JsonEditor）
+ * 浅色保持默认主题；html.dark 下覆盖画布/光标/选区/语法 token/浮层。
+ * ================================================================== */
+html.dark .cm-editor {
+  background: var(--ww-surface-2);
+  color: var(--ww-text-1);
+}
+
+html.dark .cm-editor.cm-focused {
+  outline: none;
+}
+
+html.dark .cm-scroller {
+  color: var(--ww-text-1);
+}
+
+html.dark .cm-gutters {
+  background: var(--ww-surface-2);
+  color: var(--ww-text-3);
+  border-right: 1px solid var(--ww-border);
+}
+
+html.dark .cm-activeLine,
+html.dark .cm-activeLineGutter {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+html.dark .cm-cursor,
+html.dark .cm-dropCursor {
+  border-left-color: var(--ww-text-1);
+}
+
+html.dark .cm-selectionBackground,
+html.dark .cm-content ::selection,
+html.dark .cm-editor ::selection {
+  background: rgba(54, 173, 106, 0.28) !important;
+}
+
+html.dark .cm-editor .cm-selectionMatch {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+html.dark .cm-placeholder {
+  color: var(--ww-text-3);
+}
+
+/* JSON 语法 token（高亮色在深底上调亮） */
+html.dark .cm-tok-keyword { color: #c678dd; }
+html.dark .cm-tok-string,
+html.dark .cm-tok-string2 { color: #98c379; }
+html.dark .cm-tok-number,
+html.dark .cm-tok-bool,
+html.dark .cm-tok-null { color: #d19a66; }
+html.dark .cm-tok-comment { color: #7f848e; font-style: italic; }
+html.dark .cm-tok-propertyName { color: #61afef; }
+html.dark .cm-tok-punctuation,
+html.dark .cm-tok-squareBracket,
+html.dark .cm-tok-brace { color: var(--ww-text-2); }
+
+/* 自动补全 / lint 浮层（渲染在 .cm-editor 内部） */
+html.dark .cm-tooltip {
+  background: var(--ww-surface);
+  border: 1px solid var(--ww-border);
+  color: var(--ww-text-1);
+  box-shadow: var(--ww-shadow-popover);
+}
+
+html.dark .cm-tooltip.cm-tooltip-autocomplete ul li[aria-selected] {
+  background: var(--ww-primary-soft);
+  color: var(--ww-text-1);
+}
+
+html.dark .cm-tooltip-lint {
+  background: var(--ww-surface);
+  color: var(--ww-text-1);
+}
+
+/* 暗色下 lint 错误/警告下划线保留，信息图标底色提亮 */
+html.dark .cm-lintPoint::after {
+  border-bottom-color: #e88080;
+}

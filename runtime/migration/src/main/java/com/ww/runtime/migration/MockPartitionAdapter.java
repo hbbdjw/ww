@@ -5,6 +5,7 @@ import com.ww.runtime.capability.MockCapability;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -32,18 +33,31 @@ public final class MockPartitionAdapter implements PartitionDataAdapter {
     }
 
     @Override
-    public List<byte[]> exportChunks(String capabilityName, int partition, long fromCheckpoint) {
+    public Iterator<byte[]> exportChunks(String capabilityName, int partition, long fromCheckpoint) {
         if (fromCheckpoint < 0) {
             throw new IllegalArgumentException("fromCheckpoint must be >= 0, got " + fromCheckpoint);
         }
         List<Map.Entry<String, String>> entries = new ArrayList<>(capability.exportPartition(partition));
         entries.sort(Comparator.comparing(Map.Entry::getKey));
-        List<byte[]> chunks = new ArrayList<>();
-        for (int i = (int) Math.min(fromCheckpoint, entries.size()); i < entries.size(); i++) {
-            Map.Entry<String, String> entry = entries.get(i);
-            chunks.add(encodeEntry(entry.getKey(), entry.getValue()));
-        }
-        return chunks;
+        int start = (int) Math.min(fromCheckpoint, entries.size());
+        // 惰性逐条编码（Mock 数据量小，条目列表本身已在内存）
+        return new Iterator<>() {
+            private int index = start;
+
+            @Override
+            public boolean hasNext() {
+                return index < entries.size();
+            }
+
+            @Override
+            public byte[] next() {
+                if (!hasNext()) {
+                    throw new java.util.NoSuchElementException();
+                }
+                Map.Entry<String, String> entry = entries.get(index++);
+                return encodeEntry(entry.getKey(), entry.getValue());
+            }
+        };
     }
 
     @Override
@@ -68,6 +82,14 @@ public final class MockPartitionAdapter implements PartitionDataAdapter {
     @Override
     public long verifyCount(String capabilityName, int partition) {
         return capability.partitionCount(partition);
+    }
+
+    /** 迁移完成后清理源端分区数据（委托 {@link MockCapability#clearPartition}）。 */
+    @Override
+    public boolean clearPartition(String capabilityName, int partition,
+                                   com.ww.runtime.common.NodeId source) {
+        capability.clearPartition(partition);
+        return true;
     }
 
     /** key + 0x01 + value + 0x02（UTF-8）。 */

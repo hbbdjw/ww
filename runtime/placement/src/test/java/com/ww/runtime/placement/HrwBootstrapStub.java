@@ -7,11 +7,11 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * 测试内独立复刻 common-cluster RendezvousHash 的加权 HRW 数学（bootstrap 兼容基准）：
+ * 测试内独立实现的加权 HRW 数学基准：
  * 本地 stub 节点（nodeKey + weight），MD5(input + ":" + nodeKey) 前 8 字节构造 64 位值，
- * u = unsigned / Long.MAX_VALUE，score = -ln(u) / weight，最高分者为 primary。
+ * u = unsigned / Long.MAX_VALUE，score = -ln(u) * weight，最高分者为 primary。
  *
- * <p>刻意不引用生产代码，作为移植正确性的第三方基准。</p>
+ * <p>刻意不引用生产代码，作为独立基准交叉校验 {@link WeightedRendezvousHash} 的选取结果。</p>
  */
 final class HrwBootstrapStub {
 
@@ -36,7 +36,7 @@ final class HrwBootstrapStub {
         return stubs;
     }
 
-    /** 复刻数学：返回最高分节点的 nodeKey。 */
+    /** 基准数学：返回最高分节点的 nodeKey。 */
     static String primaryNodeKey(String input, List<StubNode> stubs) throws Exception {
         String bestKey = null;
         double bestScore = Double.NEGATIVE_INFINITY;

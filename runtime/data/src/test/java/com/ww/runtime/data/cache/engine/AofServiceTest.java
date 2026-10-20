@@ -215,7 +215,7 @@ class AofServiceTest {
     }
 
     @Test
-    @DisplayName("C5：中段 CRC 失配停止回放并截断，截断后新写入可回放")
+    @DisplayName("C5：中段 CRC 失配停止回放并截断，截断后新写入可回放（v2 文件头 8 字节）")
     void crcMismatchTruncatesAndAllowsFutureWrites() throws Exception {
         // 写入三条完好记录
         AofProperties p = props();
@@ -229,10 +229,12 @@ class AofServiceTest {
         aof.stop();
 
         // 翻转第二条记录值区一字节（CRC 失配但可解码，确保走校验分支而非解析分支）
+        // §3.4：新文件为 v2 头（magic+version 共 8 字节）
         File aofFile = new File(dir, "appendonly.aof");
         byte[] rec1 = AofFormat.encodeCommand(AofFormat.OP_PUT, "k1", "v1");
         byte[] rec2 = AofFormat.encodeCommand(AofFormat.OP_PUT, "k2", "v2");
-        int corruptAt = 4 + rec1.length + (rec2.length - 5);
+        int headerV2 = 8;
+        int corruptAt = headerV2 + rec1.length + (rec2.length - 5);
         try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(aofFile, "rw")) {
             raf.seek(corruptAt);
             int b = raf.read();
@@ -249,7 +251,8 @@ class AofServiceTest {
         assertThat(restored.get("k2")).as("CRC 失配记录不得应用").isNull();
         assertThat(restored.get("k3")).as("损坏点之后的记录不得应用").isNull();
         assertThat(aof2.getStatus().getCrcFailures()).isEqualTo(1);
-        assertThat(aofFile.length()).as("文件应截断至第一条记录边界").isEqualTo(4 + rec1.length);
+        assertThat(aofFile.length()).as("文件应截断至第一条记录边界")
+                .isEqualTo(headerV2 + rec1.length);
 
         // 截断后续写应落在新边界，重启可回放（不截断则新记录永不可达）
         restored.setAofService(aof2);
@@ -279,12 +282,12 @@ class AofServiceTest {
         cache.put("k2", "v2");
         aof.stop();
 
-        // 截短文件至第二条记录中间，模拟崩溃写一半
+        // 截短文件至第二条记录中间，模拟崩溃写一半（v2 文件头 8 字节）
         File aofFile = new File(dir, "appendonly.aof");
         byte[] rec1 = AofFormat.encodeCommand(AofFormat.OP_PUT, "k1", "v1");
         byte[] rec2 = AofFormat.encodeCommand(AofFormat.OP_PUT, "k2", "v2");
         try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(aofFile, "rw")) {
-            raf.setLength(4 + rec1.length + rec2.length / 2);
+            raf.setLength(8 + rec1.length + rec2.length / 2);
         }
 
         SimpleCache<String, Object> restored = new SimpleCache<>();
@@ -294,7 +297,7 @@ class AofServiceTest {
         assertThat(restored.get("k1")).isEqualTo("v1");
         assertThat(restored.get("k2")).isNull();
         assertThat(aof2.getStatus().getCrcFailures()).isEqualTo(1);
-        assertThat(aofFile.length()).isEqualTo(4 + rec1.length);
+        assertThat(aofFile.length()).isEqualTo(8 + rec1.length);
         aof2.stop();
     }
 
@@ -313,7 +316,7 @@ class AofServiceTest {
         File aofFile = new File(dir, "appendonly.aof");
         long lenBefore = aofFile.length();
         byte[] rec1 = AofFormat.encodeCommand(AofFormat.OP_PUT, "k1", "v1");
-        int corruptAt = 4 + rec1.length + 3; // 破坏第二条记录的头部
+        int corruptAt = 8 + rec1.length + 3; // 破坏第二条记录的头部（v2 文件头 8 字节）
         try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(aofFile, "rw")) {
             raf.seek(corruptAt);
             int b = raf.read();
@@ -418,16 +421,20 @@ class AofServiceTest {
     }
 
     @Test
-    @DisplayName("C1：存量毒记录跳过+计数，后续完好记录正常应用")
+    @DisplayName("C1+§3.4：存量 v1 带毒文件（v1 编码）跳过毒记录+计数，后续完好记录正常应用")
     void poisonRecordSkippedAndCounted() throws Exception {
-        // 手工构造存量带毒文件：毒记录模拟旧版把 ZSet score 桶误写为 OP_HSET
-        // （field 为 Double → 回放 hset 的 (String) 强转抛 ClassCastException）
+        // 手工构造存量 v1 带毒文件：毒记录模拟旧版把 ZSet score 桶误写为 OP_HSET
+        // （field 为 Double → 回放 hset 的 (String) 强转抛 ClassCastException）。
+        // 记录以 v1 value 编码（writeShort 字符串长度前缀）写入，
+        // 同时覆盖 §3.4 的硬验收项：v1 存量文件回放兼容
         File aofFile = new File(dir, "appendonly.aof");
         try (java.io.DataOutputStream out = new java.io.DataOutputStream(
                 new java.io.FileOutputStream(aofFile))) {
             out.writeInt(AofFormat.AOF_MAGIC);
-            out.write(AofFormat.encodeCommand(AofFormat.OP_HSET, "zkey", 1.5d, Set.of("a")));
-            out.write(AofFormat.encodeCommand(AofFormat.OP_PUT, "ok", "v"));
+            out.write(AofFormat.encodeCommand(AofFormat.FORMAT_VERSION_V1,
+                    AofFormat.OP_HSET, "zkey", 1.5d, Set.of("a")));
+            out.write(AofFormat.encodeCommand(AofFormat.FORMAT_VERSION_V1,
+                    AofFormat.OP_PUT, "ok", "v"));
         }
 
         AofProperties p = props();

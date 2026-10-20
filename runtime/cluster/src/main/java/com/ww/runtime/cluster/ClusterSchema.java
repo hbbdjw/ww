@@ -34,8 +34,8 @@ public final class ClusterSchema {
         try (Connection conn = dataSource.getConnection();
              Statement stmt = conn.createStatement()) {
             // 跨节点并发 bootstrap 串行化：CREATE TABLE IF NOT EXISTS 在 PG 下存在
-            // 两个事务同时通过存在性检查、随后在 pg_type 插入上撞唯一键的竞态
-            // （3 节点场景暴露），用会话级 advisory lock 互斥（连接关闭兜底释放）。
+            // 两个事务同时通过存在性检查、随后在 pg_type 插入上撞唯一键的竞态，
+            // 用会话级 advisory lock 互斥（连接关闭兜底释放）。
             stmt.execute("SELECT pg_advisory_lock(4001, 1)");
             try {
                 for (String sql : statements) {

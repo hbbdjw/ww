@@ -1,11 +1,11 @@
 package com.ww.runtime.capability;
 
+import java.util.List;
+import java.util.Optional;
+
 import com.ww.runtime.common.CapabilityState;
 import com.ww.runtime.common.CapabilityType;
 import com.ww.runtime.common.NodeId;
-
-import java.util.List;
-import java.util.Optional;
 
 /**
  * 能力状态仓库：持久化"节点 × 能力"的期望态（desired，编排器意图）与
@@ -40,6 +40,11 @@ public interface CapabilityStateStore {
     List<CapabilityRecord> list();
 
     /**
+     * 删除指定节点的全部能力记录（节点退役清理）。节点不存在时为 no-op。
+     */
+    void delete(NodeId node);
+
+    /**
      * 能力状态记录值对象。
      *
      * @param node             节点
@@ -48,7 +53,7 @@ public interface CapabilityStateStore {
      * @param actual           实际态
      * @param updatedAtMillis  最后更新时间（毫秒，来自注入的 Clock）
      */
-    record CapabilityRecord(NodeId node,
+    public record CapabilityRecord(NodeId node,
                             CapabilityType type,
                             CapabilityState desired,
                             CapabilityState actual,

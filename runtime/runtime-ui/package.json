@@ -1,0 +1,33 @@
+{
+  "name": "runtime-ui",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@codemirror/lang-json": "^6.0.2",
+    "@codemirror/lint": "^6.9.7",
+    "codemirror": "^6.0.2",
+    "echarts": "^6.1.0",
+    "naive-ui": "^2.45.3",
+    "vue": "^3.5.40",
+    "vue-codemirror": "^6.1.1",
+    "vue-router": "^4.4.5"
+  },
+  "devDependencies": {
+    "@iconify-json/mdi": "^1.2.3",
+    "@iconify-json/vscode-icons": "^1.2.74",
+    "@tailwindcss/vite": "^4.3.3",
+    "@vitejs/plugin-vue": "^5.2.0",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^5.6.0",
+    "unplugin-icons": "^23.0.1",
+    "vite": "^5.4.0",
+    "vue-tsc": "^2.1.0"
+  },
+  "packageManager": "pnpm@9.15.7+sha256.1c18d98ba5bf0734fc7e28f6c8f1b43b1bcd866777decde281d14859390603fc"
+}

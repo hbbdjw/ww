@@ -24,6 +24,8 @@ message NodeInfoP {
   int64 state_epoch = 5;
   double weight = 6;
   ResourceSnapshotP resources = 7;
+  // P1-9 故障域（机架/可用区）：随心跳传播，放置副本反亲和用。
+  string zone = 8;
 }
 
 // 通用应答

@@ -4,6 +4,9 @@ import com.ww.runtime.common.MigrationException;
 import com.ww.runtime.migration.PartitionDataAdapter;
 import org.junit.jupiter.api.Test;
 
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
@@ -32,9 +35,9 @@ class CompositePartitionAdapterTest {
         }
 
         @Override
-        public List<byte[]> exportChunks(String capability, int partition, long fromCheckpoint) {
+        public Iterator<byte[]> exportChunks(String capability, int partition, long fromCheckpoint) {
             lastCapability.set(capability);
-            return List.of();
+            return Collections.emptyIterator();
         }
 
         @Override
@@ -70,7 +73,9 @@ class CompositePartitionAdapterTest {
         // 大小写归一
         assertThat(composite.itemCount("cache", 0)).isEqualTo(20L);
 
-        assertThat(composite.exportChunks("MOCK", 0, 0L)).isEmpty();
+        List<byte[]> exported = new ArrayList<>();
+        composite.exportChunks("MOCK", 0, 0L).forEachRemaining(exported::add);
+        assertThat(exported).isEmpty();
         assertThat(composite.importChunks("CACHE", 0, List.of())).isTrue();
     }
 

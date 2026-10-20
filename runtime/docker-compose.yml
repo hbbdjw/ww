@@ -10,14 +10,18 @@
 #    网桥地址），且 pg_hba.conf 放行 docker 桥接网段（如 172.16.0.0/12）。
 #  - 故障注入友好：restart: "no"，docker kill 后容器保持停止，
 #    直到手动 docker start，便于验证 DEAD 检测 / 租约接管等场景。
-#  - 节点间 gRPC 走 compose 内部 DNS（RUNTIME_NODE_HOST=服务名，端口 9100），
-#    无需发布到宿主机；此处仍发布 9101-9104 供宿主机侧调试。
+#  - 内存约束：每容器 mem_limit 8g，JVM 堆在镜像内钉住 4g（见 Dockerfile
+#    JAVA_OPTS），防止迁移高峰多容器相互挤占导致 OOM。
+#  - 节点间 gRPC 通告地址 = WSL eth0 IP（172.19.190.196）+ 各自唯一端口 9101-9104：
+#    Windows 本地 node-0（不经 compose 网络）与容器 hairpin 均经此地址互通。
+#    注意：WSL 重启后 eth0 IP 可能变化，需用 `wsl hostname -I` 获取新 IP 并同步本文件
+#    与本地 node-0 的 RUNTIME_NODE_HOST（容器 -> Windows 宿主用其默认网关 IP）。
 # ============================================================
 
 # 4 节点共享的公共环境变量（YAML 锚点）
 x-runtime-common: &runtime-common
   RUNTIME_STORE: "jdbc"
-  # 复用 admin application.yml 的数据库连接（WSL 宿主机 PostgreSQL 18）
+  # PostgreSQL 连接（WSL 宿主机 PostgreSQL 18）
   SPRING_DATASOURCE_URL: "jdbc:postgresql://host.docker.internal:5432/ww"
   SPRING_DATASOURCE_USERNAME: "postgres"
   SPRING_DATASOURCE_PASSWORD: "jw3344..."
@@ -31,6 +35,11 @@ x-runtime-common: &runtime-common
   RUNTIME_SCHEDULER_RENEW_INTERVAL_MS: "1000"
   RUNTIME_SCHEDULER_RECONCILE_INTERVAL_MS: "500"
   RUNTIME_REBALANCE_COOLDOWN_MS: "3000"
+  # STORAGE 副本数 2：节点故障时分区可由存活副本无损提升治愈，
+  # 避免落入「从死亡节点按空分区迁移」的数据丢失路径（CACHE 仍独立为 1）
+  RUNTIME_REPLICATION_FACTOR: "2"
+  # 治愈宽限期：节点被判 DEAD 后 30s 内不执行不可恢复的降级治愈迁移，押注节点重启重入
+  RUNTIME_HEALING_GRACE_PERIOD_MS: "30000"
   RUNTIME_MIGRATION_MAX_CONCURRENT: "8"
   # ---- 数据面能力：CACHE / STORAGE（启用后调度器自动引导各自 placement 环）----
   RUNTIME_CAPABILITIES_CACHE_DESIRED: "true"
@@ -46,16 +55,18 @@ services:
   rt-node1:
     image: ww-runtime:latest
     container_name: ww-rt-node1
+    mem_limit: 8g
     environment:
       <<: *runtime-common
       RUNTIME_NODE_ID: "node-1"
-      # 对外通告地址 = compose 服务名（docker 内部 DNS 可解析）
-      RUNTIME_NODE_HOST: "rt-node1"
-      RUNTIME_NODE_GRPC_PORT: "9100"
+      # 对外通告地址 = WSL eth0 IP（Windows 本地 node-0 与容器 hairpin 均可达）
+      RUNTIME_NODE_HOST: "172.19.190.196"
+      # 监听端口=注册端口（框架不支持二者分离），直接监听发布端口
+      RUNTIME_NODE_GRPC_PORT: "9101"
       SERVER_PORT: "8091"
     ports:
       - "8091:8091"   # REST 管理端点 /rt/* + 数据面 /cache/* /storage/*
-      - "9101:9100"   # gRPC（宿主机调试用）
+      - "9101:9101"   # gRPC（容器间 hairpin + Windows node-0/调试）
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
@@ -71,15 +82,16 @@ services:
   rt-node2:
     image: ww-runtime:latest
     container_name: ww-rt-node2
+    mem_limit: 8g
     environment:
       <<: *runtime-common
       RUNTIME_NODE_ID: "node-2"
-      RUNTIME_NODE_HOST: "rt-node2"
-      RUNTIME_NODE_GRPC_PORT: "9100"
+      RUNTIME_NODE_HOST: "172.19.190.196"
+      RUNTIME_NODE_GRPC_PORT: "9102"
       SERVER_PORT: "8092"
     ports:
       - "8092:8092"
-      - "9102:9100"
+      - "9102:9102"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
@@ -95,15 +107,16 @@ services:
   rt-node3:
     image: ww-runtime:latest
     container_name: ww-rt-node3
+    mem_limit: 8g
     environment:
       <<: *runtime-common
       RUNTIME_NODE_ID: "node-3"
-      RUNTIME_NODE_HOST: "rt-node3"
-      RUNTIME_NODE_GRPC_PORT: "9100"
+      RUNTIME_NODE_HOST: "172.19.190.196"
+      RUNTIME_NODE_GRPC_PORT: "9103"
       SERVER_PORT: "8093"
     ports:
       - "8093:8093"
-      - "9103:9100"
+      - "9103:9103"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
@@ -119,15 +132,16 @@ services:
   rt-node4:
     image: ww-runtime:latest
     container_name: ww-rt-node4
+    mem_limit: 8g
     environment:
       <<: *runtime-common
       RUNTIME_NODE_ID: "node-4"
-      RUNTIME_NODE_HOST: "rt-node4"
-      RUNTIME_NODE_GRPC_PORT: "9100"
+      RUNTIME_NODE_HOST: "172.19.190.196"
+      RUNTIME_NODE_GRPC_PORT: "9104"
       SERVER_PORT: "8094"
     ports:
       - "8094:8094"
-      - "9104:9100"
+      - "9104:9104"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:

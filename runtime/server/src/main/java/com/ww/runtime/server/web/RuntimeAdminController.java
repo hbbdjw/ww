@@ -1,8 +1,27 @@
 package com.ww.runtime.server.web;
 
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Optional;
+
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
 import com.ww.runtime.capability.CapabilityStateStore;
 import com.ww.runtime.capability.CapabilityStateStore.CapabilityRecord;
 import com.ww.runtime.cluster.NodeRegistry;
+import com.ww.runtime.cluster.NodeRuntime;
+import com.ww.runtime.cluster.decommission.DecommissionStore;
 import com.ww.runtime.common.CapabilityState;
 import com.ww.runtime.common.CapabilityType;
 import com.ww.runtime.common.IllegalStateTransitionException;
@@ -15,21 +34,6 @@ import com.ww.runtime.placement.PlacementStore;
 import com.ww.runtime.scheduler.DesiredStateWriter;
 import com.ww.runtime.scheduler.ReconcileLoop;
 import com.ww.runtime.server.RuntimeProperties;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.PathVariable;
-import org.springframework.web.bind.annotation.PutMapping;
-import org.springframework.web.bind.annotation.RequestBody;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RequestParam;
-import org.springframework.web.bind.annotation.RestController;
-
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Locale;
-import java.util.Map;
-import java.util.Optional;
 
 /**
  * REST 管理端点（前缀 {@code /rt}）。
@@ -48,11 +52,15 @@ public class RuntimeAdminController {
     private final MembershipService membershipService;
     private final MigrationTaskStore migrationTaskStore;
     private final PlacementStore placementStore;
+    private final DecommissionStore decommissionStore;
+    private final NodeRuntime nodeRuntime;
     private final RuntimeProperties props;
     private final NodeId self;
     /** 本节点 HTTP 端口（仅供参考：NodeInfo 未注册属主节点的 HTTP 端口，
      *  客户端需按部署约定由 ownerNode 推导其数据面端口）。 */
     private final int httpPort;
+    private final com.ww.runtime.cluster.NodeSuspicionStore suspicionStore;
+    private final com.ww.runtime.common.Clock clock;
 
     public RuntimeAdminController(ReconcileLoop reconcileLoop,
                                   DesiredStateWriter desiredStateWriter,
@@ -61,9 +69,13 @@ public class RuntimeAdminController {
                                   MembershipService membershipService,
                                   MigrationTaskStore migrationTaskStore,
                                   PlacementStore placementStore,
+                                  DecommissionStore decommissionStore,
+                                  NodeRuntime nodeRuntime,
                                   RuntimeProperties props,
                                   @Value("${server.port:8080}") int httpPort,
-                                  NodeId self) {
+                                  NodeId self,
+                                  com.ww.runtime.cluster.NodeSuspicionStore suspicionStore,
+                                  com.ww.runtime.common.Clock clock) {
         this.reconcileLoop = reconcileLoop;
         this.desiredStateWriter = desiredStateWriter;
         this.capabilityStateStore = capabilityStateStore;
@@ -71,9 +83,13 @@ public class RuntimeAdminController {
         this.membershipService = membershipService;
         this.migrationTaskStore = migrationTaskStore;
         this.placementStore = placementStore;
+        this.decommissionStore = decommissionStore;
+        this.nodeRuntime = nodeRuntime;
         this.props = props;
         this.httpPort = httpPort;
         this.self = self;
+        this.suspicionStore = suspicionStore;
+        this.clock = clock;
     }
 
     /**
@@ -85,14 +101,54 @@ public class RuntimeAdminController {
         ReconcileLoop.ClusterStatus snapshot = reconcileLoop.snapshot();
         Map<String, Object> status = new LinkedHashMap<>();
         status.put("nodeId", self.value());
-        status.put("leader", snapshot.leader());
+        // 前端期望 leader 为主节点 id（string|null）；isLeader 保留本节点视角布尔值供诊断
+        status.put("leader", snapshot.leaseOwner());
+        status.put("isLeader", snapshot.leader());
         status.put("leaseOwner", snapshot.leaseOwner());
-        status.put("capabilities", snapshot.capabilities());
+        status.put("capabilities", snapshot.capabilities().stream().map(RuntimeAdminController::capabilityDto).toList());
         status.put("primariesByCapability", snapshot.primariesByCapability());
-        status.put("self", nodeRegistry.get(self).orElse(null));
-        status.put("members", membershipService.view());
+        status.put("self", nodeRegistry.get(self).map(RuntimeAdminController::nodeDto).orElse(null));
+        // members 需输出数组（前端 ClusterStatus.members: NodeInfo[] 依赖 sort/map），
+        // 且 nodeId/host/grpcPort/state 为扁平字段，不能直接暴露内部 record（NodeId 会序列化成对象）；
+        // phi 为本节点 φ 检测器对该 peer 的当前怀疑度（本地视角观测值，非集群聚合）。
+        status.put("members", membershipService.view().values().stream()
+                .map(this::memberDto).toList());
         status.put("activeMigrationTasks", migrationTaskStore.listActive().size());
+        status.put("decommissions", decommissionStore.listActive().stream()
+                .map(r -> Map.of("nodeId", r.node().value(), "state", r.state().name())).toList());
         return status;
+    }
+
+    /**
+     * 怀疑票视图（多级故障确认可观测）：开关/TTL/存活节点数/法定人数 + 每个 suspect
+     * 的 TTL 内新鲜票数。开关关闭时数据仍返回供诊断（无提升动作）。
+     */
+    @GetMapping("/suspicions")
+    public Map<String, Object> suspicions() {
+        long ttl = props.suspicionVoteTtlMs();
+        long now = clock.nowMillis();
+        int aliveCount = nodeRegistry.listAlive().size();
+        int required = Math.min(
+                Math.max(props.suspicionMinObservers(), (aliveCount - 1) / 2 + 1),
+                Math.max(1, aliveCount - 1));
+        Map<NodeId, Integer> counts = suspicionStore.freshVoteCounts(now, ttl);
+        Map<String, Object> resp = new LinkedHashMap<>();
+        resp.put("enabled", props.suspicionQuorumEnabled());
+        resp.put("voteTtlMs", ttl);
+        resp.put("aliveNodes", aliveCount);
+        resp.put("required", required);
+        resp.put("votes", counts.entrySet().stream()
+                .map(e -> Map.of("nodeId", e.getKey().value(), "votes", e.getValue()))
+                .toList());
+        return resp;
+    }
+
+    /** 成员 DTO：nodeDto 基础字段 + 本节点 φ 检测器对该 peer 的当前怀疑度（保留两位小数）。 */
+    private Map<String, Object> memberDto(com.ww.runtime.common.NodeInfo info) {
+        Map<String, Object> dto = nodeDto(info);
+        double phi = membershipService.phiOf(info.id());
+        dto.put("phi", Math.round(phi * 100.0d) / 100.0d);
+        return dto;
     }
 
     /**
@@ -129,13 +185,79 @@ public class RuntimeAdminController {
         } catch (IllegalArgumentException | IllegalStateTransitionException e) {
             return badRequest(e.getMessage());
         }
-        return ResponseEntity.ok(capabilityStateStore.get(node, capability).orElse(null));
+        return ResponseEntity.ok(capabilityStateStore.get(node, capability)
+                .map(RuntimeAdminController::capabilityDto).orElse(null));
     }
 
     /** 全量节点视图（含 DEAD 墓碑行）。 */
     @GetMapping("/nodes")
-    public List<com.ww.runtime.common.NodeInfo> nodes() {
-        return nodeRegistry.listAll();
+    public List<Map<String, Object>> nodes() {
+        return nodeRegistry.listAll().stream().map(RuntimeAdminController::nodeDto).toList();
+    }
+
+    /**
+     * S2（§3.12②）手动复活端点：{@code POST /rt/nodes/{id}/revive}。
+     *
+     * <p>目标为本节点：走 {@link NodeRuntime#reRegister()} 完整复活（register 重置纪元 →
+     * 自检 → ACTIVE），语义与心跳自动重注册一致。目标为远端节点：仅做注册表重置回
+     * JOINING（epoch=0）——真实复活动作（自检 + 归位 ACTIVE + 自报直证）必须由其自身
+     * 进程执行（存活时心跳/自动重注册随即归位；确实已死则超时被启动孤儿清扫再置 DEAD），
+     * 本端点绝不代写远端 ACTIVE，避免假存活污染伸缩视图。</p>
+     */
+    @PostMapping("/nodes/{nodeId}/revive")
+    public ResponseEntity<Object> revive(@PathVariable("nodeId") String nodeId) {
+        NodeId node;
+        try {
+            node = NodeId.of(nodeId);
+        } catch (RuntimeException e) {
+            return badRequest(e.getMessage());
+        }
+        com.ww.runtime.common.NodeInfo info = nodeRegistry.get(node).orElse(null);
+        if (info == null) {
+            return badRequest("node not found: " + node);
+        }
+        if (node.equals(self)) {
+            if (info.state() != com.ww.runtime.common.NodeState.DEAD) {
+                return ResponseEntity.ok(Map.of("nodeId", node.value(),
+                        "result", "skipped", "state", info.state().name(),
+                        "message", "node is not DEAD, nothing to revive"));
+            }
+            nodeRuntime.reRegister();
+            return ResponseEntity.ok(Map.of("nodeId", node.value(), "result", "re-registered",
+                    "state", "ACTIVE", "epoch", "reset"));
+        }
+        // 远端：重置回 JOINING（register upsert 语义：epoch=0），由其自身收敛
+        nodeRegistry.register(com.ww.runtime.common.NodeInfo.of(info.id(), info.host(),
+                info.grpcPort(), info.httpPort(), com.ww.runtime.common.NodeState.JOINING, 0L,
+                info.weight(), info.resources()));
+        return ResponseEntity.ok(Map.of("nodeId", node.value(), "result", "rejoining",
+                "state", "JOINING",
+                "message", "epoch reset; the node's own heartbeat/self-check will converge it, "
+                        + "stale JOINING will be swept if it is truly dead"));
+    }
+
+    /** 节点信息扁平 DTO：对齐前端 NodeInfo 契约（nodeId 为字符串，不暴露内部 record）。 */
+    private static Map<String, Object> nodeDto(com.ww.runtime.common.NodeInfo info) {
+        Map<String, Object> dto = new LinkedHashMap<>();
+        dto.put("nodeId", info.id().value());
+        dto.put("host", info.host());
+        dto.put("grpcPort", info.grpcPort());
+        dto.put("httpPort", info.httpPort());
+        dto.put("state", info.state().name());
+        dto.put("stateEpoch", info.stateEpoch());
+        dto.put("weight", info.weight());
+        return dto;
+    }
+
+    /** 能力记录扁平 DTO：node 字段展开为 nodeId 字符串。 */
+    private static Map<String, Object> capabilityDto(CapabilityRecord record) {
+        Map<String, Object> dto = new LinkedHashMap<>();
+        dto.put("nodeId", record.node().value());
+        dto.put("type", record.type().name());
+        dto.put("desired", record.desired().name());
+        dto.put("actual", record.actual().name());
+        dto.put("updatedAtMillis", record.updatedAtMillis());
+        return dto;
     }
 
     /**

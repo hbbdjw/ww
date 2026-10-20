@@ -14,6 +14,7 @@ import com.ww.runtime.placement.RebalancePlanner.PartitionMove;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -94,7 +95,9 @@ class MigrationEngineTest {
         InMemoryPlacementStore placement = placementsOn(
                 partitions.stream().mapToInt(Integer::intValue).toArray());
         InMemoryMigrationTaskStore store = new InMemoryMigrationTaskStore();
-        MigrationEngine engine = new MigrationEngine(store, new MockPartitionAdapter(capability),
+        // NoClear：同进程 Mock 源/目标为同一实例，关闭源端清理以保留数据供断言
+        MigrationEngine engine = new MigrationEngine(store,
+                new NoClearAdapter(new MockPartitionAdapter(capability)),
                 placement, fastConfig(), new TestClock());
 
         List<PartitionMove> moves = partitions.stream()
@@ -121,6 +124,54 @@ class MigrationEngineTest {
     }
 
     @Test
+    void cutoverPromotesWhenTargetAlreadyHoldsReplicaRow() {
+        // 排空/治愈降级的结构性场景：目标节点已持有该分区 REPLICA 行，
+        // 直接 cutover 会违反放置主键 (capability, partition_id, node_id)，
+        // CUTOVER 阶段应改走副本提升（无损免迁移）。
+        int partition = partitionOf("promote-seed");
+        MockCapability capability = mockCapability();
+        fill(capability, partition, 10, "pr");
+        InMemoryPlacementStore placement = new InMemoryPlacementStore();
+        placement.replaceAll("mock", List.of(
+                new Placement(partition, NODE_A, PlacementRole.PRIMARY, 0L),
+                new Placement(partition, NODE_B, PlacementRole.REPLICA, 0L)));
+        InMemoryMigrationTaskStore store = new InMemoryMigrationTaskStore();
+        MigrationEngine engine = new MigrationEngine(store,
+                new NoClearAdapter(new MockPartitionAdapter(capability)),
+                placement, fastConfig(), new TestClock());
+
+        assertThat(engine.migrateAndWait("mock",
+                List.of(new PartitionMove("mock", partition, NODE_A, NODE_B)))).isTrue();
+
+        MigrationTask task = store.listAll().get(0);
+        assertThat(task.state()).isEqualTo(MigrationTaskState.COMPLETED);
+        // 提升语义：原主行删除、B 副本行升主（epoch+1），无残留重复行
+        List<Placement> rows = placement.placements("mock", partition);
+        assertThat(rows).containsExactly(new Placement(partition, NODE_B, PlacementRole.PRIMARY, 1L));
+        assertThat(placement.primaries("mock")).containsEntry(partition, NODE_B);
+    }
+
+    @Test
+    void sourcePartitionClearedAfterCompletion() {
+        int partition = partitionOf("clear-seed");
+        MockCapability capability = mockCapability();
+        fill(capability, partition, 30, "cl");
+        InMemoryPlacementStore placement = placementsOn(partition);
+        InMemoryMigrationTaskStore store = new InMemoryMigrationTaskStore();
+        MigrationEngine engine = new MigrationEngine(store, new MockPartitionAdapter(capability),
+                placement, fastConfig(), new TestClock());
+
+        assertThat(engine.migrateAndWait("mock",
+                List.of(new PartitionMove("mock", partition, NODE_A, NODE_B)))).isTrue();
+
+        MigrationTask task = store.listAll().get(0);
+        assertThat(task.state()).isEqualTo(MigrationTaskState.COMPLETED);
+        // COMPLETED 后源端分区被清理（尽力而为）：同进程 Mock 即目标数据一并清空
+        assertThat(capability.partitionCount(partition)).isZero();
+        assertThat(store.listActive()).isEmpty();
+    }
+
+    @Test
     void resumeAfterMidCopyFailureReachesCompletionWithExactReconciliation() {
         int partition = partitionOf("resume-seed");
         MockCapability capability = mockCapability();
@@ -129,7 +180,8 @@ class MigrationEngineTest {
         InMemoryMigrationTaskStore store = new InMemoryMigrationTaskStore();
 
         // 首跑：COPYING 阶段 itemsDone 达 200 时模拟一次崩溃（包装 adapter 抛出）
-        FailOnceAt200Adapter flaky = new FailOnceAt200Adapter(new MockPartitionAdapter(capability));
+        FailOnceAt200Adapter flaky = new FailOnceAt200Adapter(
+                new NoClearAdapter(new MockPartitionAdapter(capability)));
         MigrationEngine firstEngine = new MigrationEngine(store, flaky, placement,
                 fastConfig(), new TestClock());
         assertThat(firstEngine.migrateAndWait("mock",
@@ -139,8 +191,9 @@ class MigrationEngineTest {
         assertThat(failed.state()).isEqualTo(MigrationTaskState.FAILED);
         assertThat(failed.checkpointOffset()).isEqualTo(200L); // 断点恰停在第 200 条
 
-        // 模拟重启：同一 store + 正常 adapter 的新引擎续跑
-        MigrationEngine resumedEngine = new MigrationEngine(store, new MockPartitionAdapter(capability),
+        // 模拟重启：同一 store + 正常 adapter 的新引擎续跑（NoClear 保留源数据供对账）
+        MigrationEngine resumedEngine = new MigrationEngine(store,
+                new NoClearAdapter(new MockPartitionAdapter(capability)),
                 placement, fastConfig(), new TestClock());
         resumedEngine.resumeAll();
 
@@ -201,6 +254,27 @@ class MigrationEngineTest {
     }
 
     @Test
+    void duplicateExecutorAbandonsWhenTaskAlreadyCompletedByAnother() {
+        // 多节点共享 DB 的结构性并发：任务已被并发执行者推进到 COMPLETED（其 TransferStream
+        // 会以 "already terminal" 拒绝本执行者的迟到分片）。本执行者导入失败时应放弃——
+        // 任务保持 COMPLETED，不得打出 "failed at COMPLETED" 假警报或尝试 FAILED 跃迁。
+        int partition = partitionOf("dup-seed");
+        MockCapability capability = mockCapability();
+        fill(capability, partition, 10, "dk");
+        InMemoryPlacementStore placement = placementsOn(partition);
+        InMemoryMigrationTaskStore store = new InMemoryMigrationTaskStore();
+        MigrationEngine engine = new MigrationEngine(store,
+                new CompleteOnFirstImportAdapter(store),
+                placement, fastConfig(), new TestClock());
+
+        assertThat(engine.migrateAndWait("mock",
+                List.of(new PartitionMove("mock", partition, NODE_A, NODE_B)))).isTrue();
+
+        assertThat(store.listAll()).hasSize(1);
+        assertThat(store.listAll().get(0).state()).isEqualTo(MigrationTaskState.COMPLETED);
+    }
+
+    @Test
     void cancelMarksPendingTaskCancelledAndStaysTerminal() {
         int partition = partitionOf("cancel-seed");
         MockCapability capability = mockCapability();
@@ -248,6 +322,45 @@ class MigrationEngineTest {
     // 测试桩
     // ------------------------------------------------------------------
 
+    /**
+     * 关闭源端清理的包装：同进程 Mock 源/目标为同一实例，COMPLETED 后的
+     * clearPartition 会把（共享的）数据一并清空——对账类测试用它保留数据。
+     */
+    private static final class NoClearAdapter implements PartitionDataAdapter {
+
+        private final PartitionDataAdapter delegate;
+
+        NoClearAdapter(PartitionDataAdapter delegate) {
+            this.delegate = Objects.requireNonNull(delegate);
+        }
+
+        @Override
+        public long itemCount(String capability, int partition) {
+            return delegate.itemCount(capability, partition);
+        }
+
+        @Override
+        public Iterator<byte[]> exportChunks(String capability, int partition, long fromCheckpoint) {
+            return delegate.exportChunks(capability, partition, fromCheckpoint);
+        }
+
+        @Override
+        public boolean importChunks(String capability, int partition, List<byte[]> chunks) {
+            return delegate.importChunks(capability, partition, chunks);
+        }
+
+        @Override
+        public long verifyCount(String capability, int partition) {
+            return delegate.verifyCount(capability, partition);
+        }
+
+        @Override
+        public boolean clearPartition(String capability, int partition,
+                                      com.ww.runtime.common.NodeId source) {
+            return true; // 不清理
+        }
+    }
+
     /** COPYING 阶段累计导入 ≥ 200 条时抛一次异常（模拟节点崩溃）。 */
     private static final class FailOnceAt200Adapter implements PartitionDataAdapter {
 
@@ -265,7 +378,7 @@ class MigrationEngineTest {
         }
 
         @Override
-        public List<byte[]> exportChunks(String capability, int partition, long fromCheckpoint) {
+        public Iterator<byte[]> exportChunks(String capability, int partition, long fromCheckpoint) {
             return delegate.exportChunks(capability, partition, fromCheckpoint);
         }
 
@@ -305,7 +418,7 @@ class MigrationEngineTest {
         }
 
         @Override
-        public List<byte[]> exportChunks(String capability, int partition, long fromCheckpoint) {
+        public Iterator<byte[]> exportChunks(String capability, int partition, long fromCheckpoint) {
             return delegate.exportChunks(capability, partition, fromCheckpoint);
         }
 
@@ -317,6 +430,49 @@ class MigrationEngineTest {
         @Override
         public long verifyCount(String capability, int partition) {
             return delegate.verifyCount(capability, partition);
+        }
+    }
+
+    /**
+     * 模拟并发双执行者：首次 importChunks 时由「执行者 A」把任务合法推进到
+     * COMPLETED（COPYING→SYNCING→CUTOVER→VERIFYING→COMPLETED），随后导入恒
+     * false——模拟执行者 B 的迟到分片被对端 TransferStream 以终态拒绝。
+     */
+    private static final class CompleteOnFirstImportAdapter implements PartitionDataAdapter {
+
+        private final MigrationTaskStore store;
+        private boolean completedByOther;
+
+        CompleteOnFirstImportAdapter(MigrationTaskStore store) {
+            this.store = Objects.requireNonNull(store);
+        }
+
+        @Override
+        public long itemCount(String capability, int partition) {
+            return 1;
+        }
+
+        @Override
+        public Iterator<byte[]> exportChunks(String capability, int partition, long fromCheckpoint) {
+            return List.of(new byte[]{0x01, 0x02}).iterator();
+        }
+
+        @Override
+        public boolean importChunks(String capability, int partition, List<byte[]> chunks) {
+            if (!completedByOther) {
+                completedByOther = true;
+                long taskId = store.listActive().get(0).taskId();
+                store.transition(taskId, MigrationTaskState.SYNCING);
+                store.transition(taskId, MigrationTaskState.CUTOVER);
+                store.transition(taskId, MigrationTaskState.VERIFYING);
+                store.transition(taskId, MigrationTaskState.COMPLETED);
+            }
+            return false;
+        }
+
+        @Override
+        public long verifyCount(String capability, int partition) {
+            return 0;
         }
     }
 
@@ -345,6 +501,11 @@ class MigrationEngineTest {
         }
 
         @Override
+        public List<Placement> placements(String capability, int partition) {
+            return delegate.placements(capability, partition);
+        }
+
+        @Override
         public Map<Integer, NodeId> primaries(String capability) {
             return delegate.primaries(capability);
         }
@@ -352,6 +513,16 @@ class MigrationEngineTest {
         @Override
         public boolean cutover(String capability, int partition, NodeId newNode, long expectedEpoch) {
             return false; // 模拟 CAS 竞争失败（epoch 已被并发修改）
+        }
+
+        @Override
+        public boolean promoteReplica(String capability, int partition, NodeId newNode, long expectedEpoch) {
+            return delegate.promoteReplica(capability, partition, newNode, expectedEpoch);
+        }
+
+        @Override
+        public void reassignReplicas(String capability, int partition, List<NodeId> newReplicas) {
+            delegate.reassignReplicas(capability, partition, newReplicas);
         }
     }
 }

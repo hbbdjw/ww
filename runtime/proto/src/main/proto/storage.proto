@@ -1,0 +1,102 @@
+syntax = "proto3";
+
+package runtime.v1;
+
+option java_package = "com.ww.runtime.proto";
+option java_multiple_files = true;
+
+// 对象数据分片：网关转发写（ForwardPut）与副本复制（Replicate）共用。
+// 每片均携带 bucket/key；元数据全集（size/etag/version/userMeta 等）由首片携带，
+// 接收端聚合 fin 片后原子落盘。分块大小对齐 runtime.migration.chunk-size（默认 4MB）。
+message ObjectChunkP {
+  string bucket = 1;
+  string key = 2;
+  string content_type = 3;
+  int64 size = 4;                       // 对象总字节数
+  string etag = 5;                      // 内容指纹（复制路径由主节点预计算，副端不再计算）
+  int64 created_at = 6;
+  int64 version = 7;
+  map<string, string> user_meta = 8;    // S3 自定义元数据（x-amz-meta-*）
+  int64 offset = 9;                     // 本片在对象内的字节偏移
+  bool fin = 10;                        // 是否对象最后一片
+  bytes data = 11;
+}
+
+// 对象元数据（HEAD / 转发写应答 / 列举条目）。exists=false 表达对象不存在。
+message ObjectMetaP {
+  string bucket = 1;
+  string key = 2;
+  string content_type = 3;
+  int64 size = 4;
+  string etag = 5;
+  int64 created_at = 6;
+  int64 version = 7;
+  map<string, string> user_meta = 8;
+  bool exists = 9;
+}
+
+message ObjectReqP {
+  string bucket = 1;
+  string key = 2;
+  // 区间读（仅 ForwardGet 消费；其余 RPC 忽略。两者均为 0 = 返回整个对象）
+  int64 offset = 3;   // 起始字节偏移
+  int64 length = 4;   // 最多读取字节数；0 = 直到对象末尾
+  // 副本删除的版本护栏（仅 ReplicateDelete 消费；<=0 = 无版本信息，按旧语义无条件删除）：
+  // 副本本地版本高于该值时拒绝删除，防止过期删除意图抹掉新写入。
+  int64 version = 5;
+}
+
+message DeleteAckP {
+  bool ok = 1;
+  string message = 2;
+  bool deleted = 3;   // 目标对象原本存在并已删除
+}
+
+message ListReqP {
+  string bucket = 1;
+  string prefix = 2;
+  string marker = 3;
+  int32 max_keys = 4;
+}
+
+message BucketReqP {
+  string bucket = 1;
+  string action = 2;   // create / delete
+  bool recursive = 3;  // delete 时强制清空非空桶
+}
+
+// T21 桶对账：远端桶名列举（对账方向：属主节点比对各 peer 的桶注册集）
+message BucketNameP {
+  string name = 1;
+}
+
+// 对象计数请求（管理面每节点统计；bucket 为空 = 全部桶）
+message CountObjectsReqP {
+  string bucket = 1;
+}
+
+message CountObjectsAckP {
+  int64 count = 1;
+}
+
+// 对象存储数据面：网关转发（属主节点执行 S3 语义）+ 副本复制 + fan-out 列举/对账 + 桶同步 + 计数。
+// 全部挂载于 GrpcServerHost，plaintext 内网（与 Migration/ClusterControl 同信任边界）。
+service Storage {
+  // 网关转发的属主写（接收端执行 fencing 主写 putObject）
+  rpc ForwardPut(stream ObjectChunkP) returns (ObjectMetaP);
+  // 网关转发的属主读（属主端流式回传分片）
+  rpc ForwardGet(ObjectReqP) returns (stream ObjectChunkP);
+  rpc ForwardHead(ObjectReqP) returns (ObjectMetaP);
+  rpc ForwardDelete(ObjectReqP) returns (DeleteAckP);
+  // 副本接收（接收端 putReplica 落盘，version 防回退幂等）
+  rpc Replicate(stream ObjectChunkP) returns (ObjectMetaP);
+  rpc ReplicateDelete(ObjectReqP) returns (DeleteAckP);
+  // fan-out 列举（单页有界：至多 max_keys 条，网关侧按页合并截断）
+  rpc ListBucket(ListReqP) returns (stream ObjectMetaP);
+  // 桶创建/删除广播
+  rpc SyncBucket(BucketReqP) returns (DeleteAckP);
+  // T21 桶对账：列本节点注册的桶名（无分页：桶数量量级极小）
+  rpc ListBucketNames(BucketNameP) returns (stream BucketNameP);
+  // 对象计数（管理面每节点统计；bucket 为空 = 全部桶）
+  rpc CountObjects(CountObjectsReqP) returns (CountObjectsAckP);
+}

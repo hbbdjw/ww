@@ -25,7 +25,7 @@ class LogBufferTest {
     }
 
     private static LogRecord record(String message) {
-        return new LogRecord("INFO", "logger", "thread", message, null, "node-1",
+        return new LogRecord(null, "INFO", "logger", "thread", message, null, "node-1",
                 System.currentTimeMillis());
     }
 
